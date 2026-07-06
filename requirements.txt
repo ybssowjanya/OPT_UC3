@@ -1,0 +1,13 @@
+# requirements.txt
+
+anthropic>=0.40.0
+
+python-dotenv>=1.0.0
+
+claude-agent-sdk==0.2.110
+
+google-genai>=0.3.0
+
+azure-storage-blob>=12.19.0
+azure-identity>=1.15.0
+azure-cosmos>=4.5.0

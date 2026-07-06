@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from typing import Any, Optional
+
+from telemetry_store import TelemetryStore, TelemetryFetchError, resolve_storage_account
+from investigation_persistence import (
+    BlobDocumentStore, BaseDocumentStore, PersistenceError, build_document_store,
+    TRIGGER_PAYLOAD, MANIFEST, ENRICHMENT, PLANNER, AGENTS_METADATA,
+    FINDINGS, VALIDATED_FINDINGS, ROOT_CAUSES, RECOMMENDATIONS,
+    IMPACT, FINAL_REPORT, CHECKPOINTS,
+)
+
+# telemetry-container dirs that are NOT services
+NON_SERVICE_DIRS = {"item_runs", "baseline", "activity_baseline", "investigations"}
+
+# finding confidence -> UI severity. This is the single derivation rule in
+# this module and it is echoed inside every fault payload for transparency.
+SEVERITY_RULE = "confidence>=0.85: CRITICAL | >=0.70: HIGH | >=0.55: MEDIUM | else: LOW"
+
+
+def severity_for(confidence: float) -> str:
+    if confidence >= 0.85:
+        return "CRITICAL"
+    if confidence >= 0.70:
+        return "HIGH"
+    if confidence >= 0.55:
+        return "MEDIUM"
+    return "LOW"
+
+
+def ui_health(health: Optional[str]) -> str:
+    """Map stored health values to the dashboard's states."""
+    return {"Healthy": "Ok", "Warning": "Warning", "Severe": "High",
+            "Critical": "High"}.get(health or "", "Unknown")
+
+
+class DashboardService:
+    """One instance per process. Stores are created per subscription on
+    demand and cached."""
+
+    def __init__(self):
+        self._stores: dict[str, TelemetryStore] = {}
+        self._inv_stores: dict[str, BaseDocumentStore] = {}
+        # injectable factories for tests
+        self.telemetry_store_factory = TelemetryStore
+        self.document_store_factory = build_document_store
+
+    # ---- per-subscription store resolution -----------------------------
+
+    def telemetry(self, subscription_id: str) -> TelemetryStore:
+        if subscription_id not in self._stores:
+            account = resolve_storage_account(subscription_id)
+            self._stores[subscription_id] = self.telemetry_store_factory(account)
+        return self._stores[subscription_id]
+
+    def investigations(self, subscription_id: str) -> BaseDocumentStore:
+        if subscription_id not in self._inv_stores:
+            self._inv_stores[subscription_id] = self.document_store_factory(
+                telemetry_store=self.telemetry(subscription_id)
+            )
+        return self._inv_stores[subscription_id]
+
+
+    def list_subscriptions(self) -> list[dict]:
+        mapping_raw = os.environ.get("STORAGE_ACCOUNT_MAP")
+        if not mapping_raw:
+            single = os.environ.get("TELEMETRY_STORAGE_ACCOUNT")
+            if single:
+                return [{"subscription_id": None, "storage_account": single,
+                         "note": "single-account setup (TELEMETRY_STORAGE_ACCOUNT)"}]
+            raise TelemetryFetchError(
+                "No subscriptions configured: set STORAGE_ACCOUNT_MAP "
+                '(JSON {"<subscription_id>": "<storage_account>"}).'
+            )
+        try:
+            mapping = json.loads(mapping_raw)
+        except json.JSONDecodeError as e:
+            raise TelemetryFetchError(f"STORAGE_ACCOUNT_MAP is not valid JSON: {e}") from e
+        return [{"subscription_id": sub, "storage_account": acct}
+                for sub, acct in sorted(mapping.items())]
+
+    def _ab(self, subscription_id: str) -> str:
+        """Root of this subscription's """
+        return f"activity_baseline/{subscription_id}/"
+
+    async def list_services(self, subscription_id: str) -> list[dict]:
+        """Services = dirs under telemetry/activity_baseline/{subscription_id}/."""
+        store = self.telemetry(subscription_id)
+        dirs = await store.list_dirs(self._ab(subscription_id))
+        if not dirs:
+            raise TelemetryFetchError(
+                f"Nothing found under 'telemetry/{self._ab(subscription_id)}' in "
+                f"storage account '{store.storage_account}'. Check "
+                "STORAGE_ACCOUNT_MAP, read permissions, and that Team A's "
+                "deviation outputs exist for this subscription - an empty "
+                "result here is a configuration/data problem."
+            )
+        return [{"service": d} for d in dirs]
+
+    async def list_workspaces(self, subscription_id: str, service: str) -> list[dict]:
+        """resource_group/workspace pairs under
+        activity_baseline/{subscription_id}/{service}/."""
+        store = self.telemetry(subscription_id)
+        root = f"{self._ab(subscription_id)}{service}/"
+        rgs = await store.list_dirs(root)
+        if not rgs:
+            raise TelemetryFetchError(
+                f"Nothing found under 'telemetry/{root}' in storage account "
+                f"'{store.storage_account}' - unknown service name or wrong path."
+            )
+        out = []
+        for rg in rgs:
+            for ws in await store.list_dirs(f"{root}{rg}/"):
+                out.append({"service": service, "resource_group": rg, "workspace_name": ws})
+        return out
+
+    async def list_item_types(self, subscription_id: str, service: str,
+                              resource_group: str, workspace: str) -> list[str]:
+        store = self.telemetry(subscription_id)
+        root = f"{self._ab(subscription_id)}{service}/{resource_group}/{workspace}/"
+        types = await store.list_dirs(root)
+        if not types:
+            raise TelemetryFetchError(
+                f"Nothing found under 'telemetry/{root}' in "
+                f"'{store.storage_account}' - check the resource group / "
+                "workspace names (they are case-sensitive)."
+            )
+        return types
+
+    async def list_items(self, subscription_id: str, service: str,
+                         resource_group: str, workspace: str,
+                         item_type: Optional[str] = None) -> list[dict]:
+        """every item of the workspace, merged with its
+        baseline metrics (avg baseline / latest run / deviation / health)
+        when a baseline exists, and the derived optimization action."""
+        store = self.telemetry(subscription_id)
+        base = f"{self._ab(subscription_id)}{service}/{resource_group}/{workspace}"
+        types = [item_type] if item_type else await store.list_dirs(f"{base}/")
+
+        rows: list[dict] = []
+        for t in types:
+            # each item is a FOLDER of {run_id}.json deviation outputs;
+            # tolerate direct {item_name}.json files as well
+            folders, files = await store.list_children(f"{base}/{t}/")
+            names = sorted(
+                {f.rsplit("/", 1)[-1][:-5] for f in files if f.endswith(".json")}
+                | set(folders)
+            )
+            if not names and item_type:
+                raise TelemetryFetchError(
+                    f"No items found under 'telemetry/{base}/{t}/' in "
+                    f"'{store.storage_account}' - unknown item type or wrong path."
+                )
+            for name in names:
+                rows.append(await self._item_row(
+                    store, subscription_id, service, resource_group, workspace, t, name))
+        return rows
+
+    async def _item_row(self, store: TelemetryStore, subscription_id: str,
+                        service: str, resource_group: str, workspace: str,
+                        item_type: str, item_name: str) -> dict:
+        row = {
+            "subscription_id": subscription_id,
+            "service": service,
+            "resource_group": resource_group,
+            "workspace_name": workspace,
+            "item_type": item_type,
+            "item_name": item_name,
+            "pipeline_baseline": None,
+            "health_state": None,
+            "activities_count": None,
+            "calculated_at": None,
+            "estimated_monthly_cost": None,
+        }
+        try:
+            baseline = await self._latest_deviation_output(
+                store, subscription_id, service, resource_group, workspace,
+                item_type, item_name)
+        except TelemetryFetchError as e:
+            baseline = None
+            row["baseline_error"] = str(e)
+        if baseline:
+            pb = baseline.get("pipeline_baseline") or {}
+            row.update({
+                "pipeline_baseline": pb,                      
+                "health_state": pb.get("health"),   
+                "activities_count": len(baseline.get("activities") or []),
+                "calculated_at": baseline.get("calculated_at"),
+            })
+        row["optimization_action"] = await self._optimization_action(
+            subscription_id, service, workspace, item_type, item_name, row["health_state"])
+        return row
+
+    async def _latest_deviation_output(self, store: TelemetryStore,
+                                       subscription_id: str, service: str,
+                                       resource_group: str, workspace: str,
+                                       item_type: str, item_name: str) -> dict:
+        docs = await store.fetch_activity_baselines(
+            subscription_id, service, resource_group, workspace,
+            item_type, item_name, limit=1)
+        if not docs:
+            raise TelemetryFetchError(
+                f"No deviation outputs under 'telemetry/activity_baseline/"
+                f"{subscription_id}/{service}/{resource_group}/{workspace}/"
+                f"{item_type}/{item_name}/'."
+            )
+        return docs[0]
+
+    async def _optimization_action(self, subscription_id: str, service: str,
+                                   workspace: str, item_type: str, item_name: str,
+                                   health_state: str) -> dict:
+        """fix when a completed investigation with recommendations
+        exists for this item; analyze_available when unhealthy; otherwise
+        no_action_needed."""
+        latest = await self.latest_investigation(
+            subscription_id, service, workspace, item_type, item_name,
+            completed_only=True)
+        if latest and latest.get("recommendations_count"):
+            return {"action": "view_fix",
+                    "investigation_id": latest["investigation_id"],
+                    "recommendations_count": latest["recommendations_count"]}
+        if health_state in ("Warning", "High"):
+            return {"action": "analyze_available", "investigation_id": None,
+                    "recommendations_count": 0}
+        return {"action": "no_action_needed", "investigation_id": None,
+                "recommendations_count": 0}
+
+    async def item_detail(self, subscription_id: str, service: str,
+                          resource_group: str, workspace: str,
+                          item_type: str, item_name: str) -> dict:
+        store = self.telemetry(subscription_id)
+        doc = await self._latest_deviation_output(
+            store, subscription_id, service, resource_group, workspace,
+            item_type, item_name)
+
+        health_state = ui_health((doc.get("pipeline_baseline") or {}).get("health"))
+        return {
+            **doc,  # the whole stored JSON, untouched
+            "health_state": health_state,
+            "optimization_action": await self._optimization_action(
+                subscription_id, service, workspace, item_type, item_name, health_state),
+            "investigations": await self.investigation_history(
+                subscription_id, service, workspace, item_type, item_name),
+        }
+
+    # Investigations - history / trigger / status
+
+    async def investigation_history(self, subscription_id: str, service: str,
+                                    workspace: str, item_type: str,
+                                    item_name: str, limit: int = 10) -> list[dict]:
+        """Past investigations for this item"""
+        inv = self.investigations(subscription_id)
+        out = []
+        for inv_id in await inv.list_investigation_ids(service):
+            if len(out) >= limit:
+                break
+            try:
+                m = await inv.get(service, inv_id, MANIFEST)
+            except PersistenceError:
+                continue
+            if (m.get("item_name") == item_name
+                    and m.get("workspace_name") == workspace
+                    and m.get("item_type") == item_type):
+                out.append({
+                    "investigation_id": m["investigation_id"],
+                    "status": m.get("status"),
+                    "error": m.get("error"),
+                    "started_at": m.get("started_at"),
+                    "ended_at": m.get("ended_at"),
+                    "findings_count": m.get("findings_count"),
+                    "validated_findings_count": m.get("validated_findings_count"),
+                    "root_causes_count": m.get("root_causes_count"),
+                    "recommendations_count": m.get("recommendations_count"),
+                    "total_input_tokens": m.get("total_input_tokens"),
+                    "total_output_tokens": m.get("total_output_tokens"),
+                })
+        return out
+
+    async def latest_investigation(self, subscription_id: str, service: str,
+                                   workspace: str, item_type: str, item_name: str,
+                                   completed_only: bool = False) -> Optional[dict]:
+        history = await self.investigation_history(
+            subscription_id, service, workspace, item_type, item_name, limit=50)
+        for h in history:
+            if not completed_only or h["status"] == "completed":
+                return h
+        return None
+
+    async def build_trigger_payload(self, subscription_id: str, service: str,
+                                    resource_group: str, workspace: str,
+                                    item_type: str, item_name: str) -> dict:
+
+        store = self.telemetry(subscription_id)
+        payload = await self._latest_deviation_output(
+            store, subscription_id, service, resource_group, workspace,
+            item_type, item_name)
+        # the pipeline needs the subscription for storage resolution
+        payload.setdefault("subscription_id", subscription_id)
+        payload.setdefault("service", service)
+        payload.setdefault("resource_group", resource_group)
+        payload.setdefault("workspace_name", workspace)
+        payload.setdefault("item_type", item_type)
+        payload.setdefault("item_name", item_name)
+        return payload
+
+    async def investigation_status(self, subscription_id: str, service: str,
+                                   investigation_id: str) -> dict:
+        return await self.investigations(subscription_id).get(
+            service, investigation_id, MANIFEST)
+
+    async def compose_analysis(self, subscription_id: str, service: str,
+                               investigation_id: str) -> dict:
+        inv = self.investigations(subscription_id)
+
+        async def load(filename, default):
+            try:
+                return await inv.get(service, investigation_id, filename)
+            except PersistenceError:
+                return default
+
+        manifest = await inv.get(service, investigation_id, MANIFEST)  # required
+        trigger = await load(TRIGGER_PAYLOAD, {})
+        enrichment = await load(ENRICHMENT, {})
+        agents_meta = await load(AGENTS_METADATA, [])
+        validated = await load(VALIDATED_FINDINGS, [])
+        root_causes = await load(ROOT_CAUSES, [])
+        recommendations = await load(RECOMMENDATIONS, [])
+        impact = await load(IMPACT, {})
+        report = await load(FINAL_REPORT, {})
+        checkpoints = await load(CHECKPOINTS, [])
+
+        notebooks = (enrichment or {}).get("notebooks", {}) or {}
+
+        # -- header ------------------------------------------------------
+        header = {
+            "investigation_id": investigation_id,
+            "status": manifest.get("status"),
+            "error": manifest.get("error"),
+            "item": {k: manifest.get(k) for k in
+                     ("subscription_id", "service", "resource_group",
+                      "workspace_name", "item_type", "item_name")},
+            "pipeline_health": manifest.get("pipeline_health"),
+            "pipeline_deviation_pct": manifest.get("pipeline_deviation_pct"),
+            "pipeline_deviation_seconds": manifest.get("pipeline_deviation_seconds"),
+    
+            "target_code_segments": [
+                {"activity_name": name,
+                 "notebook_item_name": nb.get("notebook_item_name"),
+                 "language": nb.get("language"),
+                 "source_chars": len(nb.get("source_code") or "")}
+                for name, nb in notebooks.items()
+            ],
+            "started_at": manifest.get("started_at"),
+            "ended_at": manifest.get("ended_at"),
+            "stage_timings": manifest.get("stage_timings"),
+            "total_input_tokens": manifest.get("total_input_tokens"),
+            "total_output_tokens": manifest.get("total_output_tokens"),
+            # cost not stored yet
+            "estimated_monthly_cost": None,
+        }
+
+        # -- "analysis pipeline telemetry" ----------------------
+        pipeline_telemetry = [
+            {"step": c.get("label"), "at": c.get("at"), "sequence": c.get("sequence")}
+            for c in checkpoints
+        ]
+
+        # -- agents involved ----------------------------------------------
+        agents = [
+            {"agent": r.get("agent"), "stage": r.get("stage"),
+             "model": r.get("model"), "provider": r.get("provider"),
+             "latency_seconds": r.get("latency_seconds"),
+             "input_tokens": r.get("input_tokens"),
+             "output_tokens": r.get("output_tokens"),
+             "findings_count": (r.get("outputs") or {}).get("findings_count"),
+             "status": r.get("status"), "error": r.get("error")}
+            for r in agents_meta
+        ]
+
+        # -- core bottleneck = highest-confidence root cause ---------------
+        rcs = sorted(root_causes, key=lambda r: r.get("confidence", 0), reverse=True)
+        core_bottleneck = None
+        if rcs:
+            top = rcs[0]
+            core_bottleneck = {
+                "category": top.get("category"),
+                "description": top.get("description"),
+                "causal_chain": top.get("causal_chain"),
+                "supporting_findings": top.get("supporting_findings"),
+                "confidence": top.get("confidence"),
+            }
+
+        # -- recommendation analysis ---------------------------------------
+        recommendation_analysis = [
+            {"title": r.get("title"), "description": r.get("description"),
+             "target_activity": r.get("target_activity"),
+             "impact_score": r.get("impact_score"),
+             "effort_score": r.get("effort_score"),
+             "risk_score": r.get("risk_score"),
+             "confidence": r.get("confidence")}
+            for r in recommendations
+        ]
+
+        # -- impact agent output -------------
+        target_optimization_forecast = impact or None
+
+        # --  validated findings + derived severity ------
+        structural_faults = []
+        for f in validated:
+            conf = float(f.get("confidence") or 0)
+            structural_faults.append({
+                "title": f.get("summary"),
+                "severity": severity_for(conf),
+                "severity_rule": SEVERITY_RULE,
+                "confidence": conf,
+                "detected_by": f.get("agent"),
+                "affected_activities": f.get("affected_activities"),
+                "evidence": f.get("evidence"),
+                "verified": f.get("verified", True),
+            })
+        structural_faults.sort(
+            key=lambda x: ["CRITICAL", "HIGH", "MEDIUM", "LOW"].index(x["severity"]))
+
+        
+        fixes_by_activity: dict[str, list] = {}
+        for fix in (report.get("suggested_fixes") or []):
+            target = (fix or {}).get("target_activity") or "__pipeline__"
+            fixes_by_activity.setdefault(target, []).append(fix)
+        patches_by_activity: dict[str, list] = {}
+        for p in (report.get("apply_fix_payloads") or []):
+            target = (p or {}).get("target_activity") or "__pipeline__"
+            patches_by_activity.setdefault(target, []).append(p)
+
+        code_refactoring_plan = []
+        for name, nb in notebooks.items():
+            code_refactoring_plan.append({
+                "activity_name": name,
+                "language": nb.get("language"),
+                "baseline_script": nb.get("source_code"),
+                "suggested_fixes": fixes_by_activity.get(name) or [],
+                "auto_generated_patch": patches_by_activity.get(name) or None,
+                "patch_available": bool(patches_by_activity.get(name)),
+            })
+
+        return {
+            "header": header,
+            "pipeline_telemetry": pipeline_telemetry,
+            "agents": agents,
+            "agent_recommendation_analysis": {
+                "core_bottleneck": core_bottleneck,
+                "recommendations": recommendation_analysis,
+                "target_optimization_forecast": target_optimization_forecast,
+            },
+            "structural_faults": structural_faults,
+            "structural_faults_count": len(structural_faults),
+            "code_refactoring_plan": code_refactoring_plan,
+            "root_causes": rcs,
+            "trigger_payload": trigger.get("payload"),
+        }
