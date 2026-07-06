@@ -164,7 +164,43 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
         "root_causes_count": manifest.get("root_causes_count"),
         "recommendations_count": manifest.get("recommendations_count"),
     }
-    
+
+
+# @app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}/status")
+# async def investigation_status(sub: str, service: str, investigation_id: str):
+#     """Poll target: the persisted manifest (flushed at every checkpoint)."""
+#     try:
+#         manifest = await svc.investigation_status(sub, service, investigation_id)
+#     except PersistenceError as e:
+#         # id was just issued but first checkpoint not yet flushed
+#         if investigation_id in _running_tasks:
+#             return {"investigation_id": investigation_id, "status": "starting"}
+#         raise _http(e)
+#     except Exception as e:
+#         raise _http(e)
+#     manifest["in_this_process"] = investigation_id in _running_tasks
+#     return manifest
+
+
+# @app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}/analysis")
+# async def investigation_analysis(sub: str, service: str, investigation_id: str):
+#     """The full analysis screen, composed only from persisted files."""
+#     try:
+#         return await svc.compose_analysis(sub, service, investigation_id)
+#     except Exception as e:
+#         raise _http(e)
+
+
+# @app.get("/api/subscriptions/{sub}/services/{service}/rg/{rg}/ws/{ws}/items/{item_type}/{item_name}/investigations")
+# async def item_investigations(sub: str, service: str, rg: str, ws: str,
+#                               item_type: str, item_name: str,
+#                               limit: int = Query(default=10, le=50)):
+#     try:
+#         return await svc.investigation_history(sub, service, ws, item_type, item_name, limit)
+#     except Exception as e:
+#         raise _http(e)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok",
