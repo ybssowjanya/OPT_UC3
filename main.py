@@ -1,9 +1,4 @@
-"""
-Run:  uvicorn dashboard_api:app --reload --port 8000
-"""
-
 from __future__ import annotations
-
 import asyncio
 import os
 from typing import Optional
