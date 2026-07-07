@@ -339,6 +339,8 @@ class DashboardService:
             "investigation_id": investigation_id,
             "status": manifest.get("status"),
             "error": manifest.get("error"),
+            "skipped_reason": manifest.get("skipped_reason") or report.get("skipped_reason"),
+            "message": manifest.get("message") or report.get("message"),
             "item": {k: manifest.get(k) for k in
                      ("subscription_id", "service", "resource_group",
                       "workspace_name", "item_type", "item_name")},
