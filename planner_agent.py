@@ -152,6 +152,15 @@ class PlannerAgent:
 
     def select_agents_to_dispatch(self, ctx: InvestigationContext) -> set[AgentRole]:
         selected: set[AgentRole] = set()
+
+        # Overall pipeline_health is the authoritative signal. If the pipeline
+        # as a whole is Healthy, we do not dispatch any investigation agents -
+        # even if individual activities show Warning/Severe (this happens with
+        # small, noisy percentage swings on short-duration activities and does
+        # not represent an actual production issue worth root-causing).
+        if ctx.pipeline_health == "Healthy":
+            return selected
+
         degraded = ctx.degraded_activities()
 
         for activity in degraded:
@@ -160,7 +169,9 @@ class PlannerAgent:
             )
             selected.update(agents)
 
-        if not selected and ctx.pipeline_health != "Healthy":
+        if not selected:
+            # pipeline_health is Warning/Severe but no single activity crossed
+            # the degraded threshold on its own - still worth a baseline look.
             selected.add(AgentRole.RUNTIME_INTELLIGENCE)
 
         if len(selected) > 1:
@@ -238,6 +249,8 @@ class PlannerAgent:
             "investigation_id": self.investigation_id,
             "status": self._status,
             "error": self._error,
+            "skipped_reason": self._skipped_reason,
+            "message": self._message,
             "started_at": self._started_at,
             "ended_at": self._ended_at,
             "total_seconds_so_far": round(perf_counter() - self._t0, 3),
@@ -331,6 +344,8 @@ class PlannerAgent:
         self._error = None
         self._started_at = started_at
         self._ended_at = None
+        self._skipped_reason = None
+        self._message = None
         self.stage_timings = stage_timings
         self.checkpoints: list[dict] = []
         self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
@@ -361,6 +376,45 @@ class PlannerAgent:
             t = perf_counter()
             round_num = 0
             pending_agents = self.select_agents_to_dispatch(ctx)
+
+            if not pending_agents:
+                # Pipeline is Healthy (or otherwise had nothing degraded to
+                # investigate) - no agents were dispatched. Skip the entire
+                # downstream chain (evidence validation / root cause /
+                # recommendation / impact / report all have nothing to work
+                # with anyway) and return a clear, explicit "no investigation
+                # needed" result instead of a report that looks complete but
+                # is silently empty.
+                stage_timings["intelligence_agents_seconds"] = 0.0
+                message = (
+                    f"'{ctx.item_name}' ({ctx.service}/{ctx.item_type}) is Healthy "
+                    f"(deviation {ctx.pipeline_deviation_pct:+.2f}%, "
+                    f"{ctx.pipeline_deviation_seconds:+.2f}s vs baseline) - "
+                    "no degraded activities were found, so no investigation "
+                    "was performed."
+                )
+                state.final_report = {
+                    "investigation_id": self.investigation_id,
+                    "skipped": True,
+                    "skipped_reason": "pipeline_healthy",
+                    "message": message,
+                    "pipeline_health": ctx.pipeline_health,
+                    "pipeline_deviation_pct": ctx.pipeline_deviation_pct,
+                    "pipeline_deviation_seconds": ctx.pipeline_deviation_seconds,
+                    "suggested_fixes": [],
+                    "apply_fix_payloads": [],
+                }
+                for filename in (FINDINGS, VALIDATED_FINDINGS, ROOT_CAUSES,
+                                 RECOMMENDATIONS, IMPACT):
+                    await self._put(ctx, filename, [])
+                await self._put(ctx, FINAL_REPORT, state.final_report)
+
+                self._status = "completed"
+                self._skipped_reason = "pipeline_healthy"
+                self._message = message
+                self._ended_at = datetime.now(timezone.utc).isoformat()
+                await self.save_investigation_state(state, "skipped_pipeline_healthy")
+                return state
 
             while pending_agents and round_num < MAX_PLANNER_ROUNDS:
                 round_num += 1
