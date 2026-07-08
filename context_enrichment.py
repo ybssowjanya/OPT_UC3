@@ -95,6 +95,36 @@ def _extract_notebook_payload(asset: dict) -> dict:
     }
 
 
+def _flatten_activities(activities: list) -> list:
+    """Recursively yield all activity defs, including those nested inside
+    IfCondition (if_true_activities / if_false_activities),
+    ForEach / Until (activities),
+    Switch (cases[].activities / default_activities).
+    """
+    result = []
+    for act in activities or []:
+        result.append(act)
+        act_type = act.get("type", "")
+
+        if act_type == "IfCondition":
+            result.extend(_flatten_activities(act.get("if_true_activities") or []))
+            result.extend(_flatten_activities(act.get("if_false_activities") or []))
+
+        elif act_type in ("ForEach", "Until"):
+            result.extend(_flatten_activities(act.get("activities") or []))
+
+        elif act_type == "Switch":
+            for case in act.get("cases") or []:
+                result.extend(_flatten_activities(case.get("activities") or []))
+            result.extend(_flatten_activities(act.get("default_activities") or []))
+
+        # ExecutePipeline / TryCatch / Scope containers (future-proofing)
+        elif act.get("activities"):
+            result.extend(_flatten_activities(act.get("activities") or []))
+
+    return result
+
+
 def _resolve_notebook_reference(service: str, item_definition: dict,
                                 activity: ActivityDeviation) -> str:
     """Which notebook asset implements this activity"""
@@ -103,9 +133,9 @@ def _resolve_notebook_reference(service: str, item_definition: dict,
         return activity.activity_name
 
     # synapse / adf: find the activity inside the pipeline definition and
-    # read its notebook reference
+    # read its notebook reference (search recursively through nested containers)
     extra = (item_definition or {}).get("extra_metadata") or {}
-    for act_def in extra.get("activities", []) or []:
+    for act_def in _flatten_activities(extra.get("activities", []) or []):
         if act_def.get("name") == activity.activity_name:
             nb = act_def.get("notebook") or {}
             ref = nb.get("reference_name") or nb.get("referenceName")
@@ -142,7 +172,8 @@ def _extract_dependencies(item_definition: dict, recent_runs: list[dict]) -> dic
     deps: dict[str, list[str]] = {}
 
     extra = (item_definition or {}).get("extra_metadata") or {}
-    for act_def in extra.get("activities", extra.get("tasks", [])) or []:
+    top_level = extra.get("activities", extra.get("tasks", [])) or []
+    for act_def in _flatten_activities(top_level):
         name = act_def.get("name") or act_def.get("task_key")
         if not name:
             continue

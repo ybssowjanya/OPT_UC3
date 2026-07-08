@@ -14,6 +14,12 @@ class DependencyLineageAgent(BaseIntelligenceAgent):
     enrichment_keys = ("definition", "recent_runs", "dependencies")
     role_name = "dependency_lineage_agent"
     model = "claude-sonnet-4-6"
+    # This agent enumerates the full dependency graph plus critical-path and
+    # branching analysis across every activity, so it needs materially more
+    # output room than the other intelligence agents - it was the one
+    # observed hitting the shared 2000-token ceiling and returning truncated,
+    # unparseable JSON.
+    max_tokens = 6000
     system_prompt = (
         "You analyze activity dependency chains and branching logic to find "
         "the critical path and assess upstream-to-downstream delay propagation. "

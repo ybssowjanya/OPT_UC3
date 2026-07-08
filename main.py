@@ -1,11 +1,7 @@
-"""
-Run:  uvicorn dashboard_api:app --reload --port 8000
-"""
-
 from __future__ import annotations
-
 import asyncio
 import os
+import threading
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
@@ -30,7 +26,9 @@ app.add_middleware(
 )
 
 svc = DashboardService()
-_running_tasks: dict[str, asyncio.Task] = {}
+
+_running_threads: dict[str, threading.Thread] = {}
+_lock = threading.Lock()
 
 
 def _http(e: Exception) -> HTTPException:
@@ -91,16 +89,23 @@ async def item_detail(sub: str, service: str, rg: str, ws: str,
 
 
 
-async def _run_investigation_task(payload: dict, investigation_id: str):
-
+def _run_investigation_thread(payload: dict, investigation_id: str) -> None:
+    """Thread entrypoint: runs its own private event loop for the full
+    investigation lifecycle, isolated from the FastAPI request-handling loop.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
         planner = PlannerAgent()
-        await planner.run_investigation(payload, investigation_id=investigation_id)
+        loop.run_until_complete(
+            planner.run_investigation(payload, investigation_id=investigation_id)
+        )
     except Exception as e:
-        
         print(f"[analyze:{investigation_id}] failed: {type(e).__name__}: {e}")
     finally:
-        _running_tasks.pop(investigation_id, None)
+        loop.close()
+        with _lock:
+            _running_threads.pop(investigation_id, None)
 
 
 @app.post("/api/subscriptions/{sub}/services/{service}/rg/{rg}/ws/{ws}/items/{item_type}/{item_name}/analyze")
@@ -112,8 +117,16 @@ async def analyze_workload(sub: str, service: str, rg: str, ws: str,
         raise _http(e)
 
     investigation_id = PlannerAgent.new_investigation_id()
-    task = asyncio.create_task(_run_investigation_task(payload, investigation_id))
-    _running_tasks[investigation_id] = task
+
+    thread = threading.Thread(
+        target=_run_investigation_thread,
+        args=(payload, investigation_id),
+        name=f"investigation-{investigation_id}",
+        daemon=True,   # never blocks process shutdown
+    )
+    with _lock:
+        _running_threads[investigation_id] = thread
+    thread.start()   # returns almost immediately - does not wait for the investigation
 
     base = f"/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}"
     return {
@@ -129,10 +142,13 @@ async def analyze_workload(sub: str, service: str, rg: str, ws: str,
 
 @app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}")
 async def investigation_poll(sub: str, service: str, investigation_id: str):
+    with _lock:
+        is_running_here = investigation_id in _running_threads
+
     try:
         manifest = await svc.investigation_status(sub, service, investigation_id)
     except PersistenceError as e:
-        if investigation_id in _running_tasks:
+        if is_running_here:
             return {"investigation_id": investigation_id, "status": "starting"}
         raise _http(e)
     except Exception as e:
@@ -144,8 +160,12 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
             analysis = await svc.compose_analysis(sub, service, investigation_id)
         except Exception as e:
             raise _http(e)
-        return {"investigation_id": investigation_id, "status": "completed",
-                "analysis": analysis}
+        response = {"investigation_id": investigation_id, "status": "completed",
+                    "analysis": analysis}
+        if manifest.get("skipped_reason"):
+            response["skipped_reason"] = manifest["skipped_reason"]
+            response["message"] = manifest.get("message")
+        return response
 
     if status == "failed":
         return {"investigation_id": investigation_id, "status": "failed",
@@ -163,46 +183,49 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
         "validated_findings_count": manifest.get("validated_findings_count"),
         "root_causes_count": manifest.get("root_causes_count"),
         "recommendations_count": manifest.get("recommendations_count"),
+        "in_this_process": is_running_here,
     }
 
 
-@app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}/status")
-async def investigation_status(sub: str, service: str, investigation_id: str):
-    """Poll target: the persisted manifest (flushed at every checkpoint)."""
-    try:
-        manifest = await svc.investigation_status(sub, service, investigation_id)
-    except PersistenceError as e:
-        # id was just issued but first checkpoint not yet flushed
-        if investigation_id in _running_tasks:
-            return {"investigation_id": investigation_id, "status": "starting"}
-        raise _http(e)
-    except Exception as e:
-        raise _http(e)
-    manifest["in_this_process"] = investigation_id in _running_tasks
-    return manifest
+# @app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}/status")
+# async def investigation_status(sub: str, service: str, investigation_id: str):
+#     """Poll target: the persisted manifest (flushed at every checkpoint)."""
+#     try:
+#         manifest = await svc.investigation_status(sub, service, investigation_id)
+#     except PersistenceError as e:
+#         # id was just issued but first checkpoint not yet flushed
+#         if investigation_id in _running_threads:
+#             return {"investigation_id": investigation_id, "status": "starting"}
+#         raise _http(e)
+#     except Exception as e:
+#         raise _http(e)
+#     manifest["in_this_process"] = investigation_id in _running_threads
+#     return manifest
 
 
-@app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}/analysis")
-async def investigation_analysis(sub: str, service: str, investigation_id: str):
-    """The full analysis screen, composed only from persisted files."""
-    try:
-        return await svc.compose_analysis(sub, service, investigation_id)
-    except Exception as e:
-        raise _http(e)
+# @app.get("/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}/analysis")
+# async def investigation_analysis(sub: str, service: str, investigation_id: str):
+#     """The full analysis screen, composed only from persisted files."""
+#     try:
+#         return await svc.compose_analysis(sub, service, investigation_id)
+#     except Exception as e:
+#         raise _http(e)
 
 
-@app.get("/api/subscriptions/{sub}/services/{service}/rg/{rg}/ws/{ws}/items/{item_type}/{item_name}/investigations")
-async def item_investigations(sub: str, service: str, rg: str, ws: str,
-                              item_type: str, item_name: str,
-                              limit: int = Query(default=10, le=50)):
-    try:
-        return await svc.investigation_history(sub, service, ws, item_type, item_name, limit)
-    except Exception as e:
-        raise _http(e)
+# @app.get("/api/subscriptions/{sub}/services/{service}/rg/{rg}/ws/{ws}/items/{item_type}/{item_name}/investigations")
+# async def item_investigations(sub: str, service: str, rg: str, ws: str,
+#                               item_type: str, item_name: str,
+#                               limit: int = Query(default=10, le=50)):
+#     try:
+#         return await svc.investigation_history(sub, service, ws, item_type, item_name, limit)
+#     except Exception as e:
+#         raise _http(e)
 
 
 @app.get("/api/health")
 def health():
+    with _lock:
+        running = sorted(_running_threads)
     return {"status": "ok",
             "resolver_version": RESOLVER_VERSION,
-            "running_investigations": sorted(_running_tasks)}
+            "running_investigations": running}

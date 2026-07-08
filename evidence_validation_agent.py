@@ -56,13 +56,25 @@ class EvidenceValidationAgent:
         boost = min(0.15 * (corroborating_count - 1), 0.3) if corroborating_count > 1 else 0.0
         return min(1.0, base + boost)
 
+    @staticmethod
+    def _is_parse_failure(f: AgentFinding) -> bool:
+        return bool((f.evidence or {}).get("parse_error"))
+
     async def validate(self, ctx: InvestigationContext, findings: list[AgentFinding]) -> list[AgentFinding]:
-        agents_by_activity: dict[str, set] = {}
+
+        real_findings = []
         for f in findings:
+            if self._is_parse_failure(f):
+                f.status = "rejected"
+                continue
+            real_findings.append(f)
+
+        agents_by_activity: dict[str, set] = {}
+        for f in real_findings:
             for act in (f.affected_activities or ["__pipeline_level__"]):
                 agents_by_activity.setdefault(act, set()).add(f.agent)
 
-        merged = self.deduplicate_and_merge_findings(findings)
+        merged = self.deduplicate_and_merge_findings(real_findings)
 
         validated: list[AgentFinding] = []
         for f in merged:
@@ -87,4 +99,3 @@ class EvidenceValidationAgent:
 
     def generate_validated_evidence_package(self, validated: list[AgentFinding]) -> list[AgentFinding]:
         return sorted(validated, key=lambda f: f.confidence, reverse=True)
-

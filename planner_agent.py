@@ -39,6 +39,7 @@ from root_cause_agent import RootCauseAgent
 from recommendation_agent import RecommendationAgent
 from impact_agent import ImpactAgent
 from action_plan_report_agent import ActionPlanReportAgent
+from azure_openai_client import azure_gpt5_available, azure_gpt5_caller
 
 ACTIVITY_TYPE_TO_AGENTS: dict[str, list[AgentRole]] = {
     # Notebook/code activities -> all three focused code agents + runtime
@@ -102,8 +103,14 @@ class PlannerAgent:
         self.evidence_validation_agent = EvidenceValidationAgent()
         self.root_cause_agent = RootCauseAgent()
         self.recommendation_agent = RecommendationAgent()
-        self.impact_agent = ImpactAgent()
-        self.report_agent = ActionPlanReportAgent()
+
+        # Azure OpenAI (GPT-5 deployment) is used for the impact/report
+        # stages when AZURE_OPENAI_* env vars are configured; otherwise both
+        # agents fall back to their deterministic (pure-Python) path, which
+        # is what they've always done when mcp_gpt5_caller is None.
+        gpt5_caller = azure_gpt5_caller if azure_gpt5_available() else None
+        self.impact_agent = ImpactAgent(mcp_gpt5_caller=gpt5_caller)
+        self.report_agent = ActionPlanReportAgent(mcp_gpt5_caller=gpt5_caller)
 
         self._sub_agent_pool = {
             AgentRole.RUNTIME_INTELLIGENCE: RuntimeIntelligenceAgent(asset_loader),
@@ -152,6 +159,15 @@ class PlannerAgent:
 
     def select_agents_to_dispatch(self, ctx: InvestigationContext) -> set[AgentRole]:
         selected: set[AgentRole] = set()
+
+        # Overall pipeline_health is the authoritative signal. If the pipeline
+        # as a whole is Healthy, we do not dispatch any investigation agents -
+        # even if individual activities show Warning/Severe (this happens with
+        # small, noisy percentage swings on short-duration activities and does
+        # not represent an actual production issue worth root-causing).
+        if ctx.pipeline_health == "Healthy":
+            return selected
+
         degraded = ctx.degraded_activities()
 
         for activity in degraded:
@@ -160,7 +176,9 @@ class PlannerAgent:
             )
             selected.update(agents)
 
-        if not selected and ctx.pipeline_health != "Healthy":
+        if not selected:
+            # pipeline_health is Warning/Severe but no single activity crossed
+            # the degraded threshold on its own - still worth a baseline look.
             selected.add(AgentRole.RUNTIME_INTELLIGENCE)
 
         if len(selected) > 1:
@@ -238,6 +256,8 @@ class PlannerAgent:
             "investigation_id": self.investigation_id,
             "status": self._status,
             "error": self._error,
+            "skipped_reason": self._skipped_reason,
+            "message": self._message,
             "started_at": self._started_at,
             "ended_at": self._ended_at,
             "total_seconds_so_far": round(perf_counter() - self._t0, 3),
@@ -331,6 +351,8 @@ class PlannerAgent:
         self._error = None
         self._started_at = started_at
         self._ended_at = None
+        self._skipped_reason = None
+        self._message = None
         self.stage_timings = stage_timings
         self.checkpoints: list[dict] = []
         self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
@@ -361,6 +383,45 @@ class PlannerAgent:
             t = perf_counter()
             round_num = 0
             pending_agents = self.select_agents_to_dispatch(ctx)
+
+            if not pending_agents:
+                # Pipeline is Healthy (or otherwise had nothing degraded to
+                # investigate) - no agents were dispatched. Skip the entire
+                # downstream chain (evidence validation / root cause /
+                # recommendation / impact / report all have nothing to work
+                # with anyway) and return a clear, explicit "no investigation
+                # needed" result instead of a report that looks complete but
+                # is silently empty.
+                stage_timings["intelligence_agents_seconds"] = 0.0
+                message = (
+                    f"'{ctx.item_name}' ({ctx.service}/{ctx.item_type}) is Healthy "
+                    f"(deviation {ctx.pipeline_deviation_pct:+.2f}%, "
+                    f"{ctx.pipeline_deviation_seconds:+.2f}s vs baseline) - "
+                    "no degraded activities were found, so no investigation "
+                    "was performed."
+                )
+                state.final_report = {
+                    "investigation_id": self.investigation_id,
+                    "skipped": True,
+                    "skipped_reason": "pipeline_healthy",
+                    "message": message,
+                    "pipeline_health": ctx.pipeline_health,
+                    "pipeline_deviation_pct": ctx.pipeline_deviation_pct,
+                    "pipeline_deviation_seconds": ctx.pipeline_deviation_seconds,
+                    "suggested_fixes": [],
+                    "apply_fix_payloads": [],
+                }
+                for filename in (FINDINGS, VALIDATED_FINDINGS, ROOT_CAUSES,
+                                 RECOMMENDATIONS, IMPACT):
+                    await self._put(ctx, filename, [])
+                await self._put(ctx, FINAL_REPORT, state.final_report)
+
+                self._status = "completed"
+                self._skipped_reason = "pipeline_healthy"
+                self._message = message
+                self._ended_at = datetime.now(timezone.utc).isoformat()
+                await self.save_investigation_state(state, "skipped_pipeline_healthy")
+                return state
 
             while pending_agents and round_num < MAX_PLANNER_ROUNDS:
                 round_num += 1
@@ -456,7 +517,8 @@ class PlannerAgent:
             ctx.agent_run_log.append(self._stage_record(
                 stage="impact", agent=self.impact_agent,
                 started_at=stage_start, t0=t,
-                method=("mcp_gpt5" if getattr(self.impact_agent, "mcp_gpt5_caller", None) else "deterministic"),
+                method=getattr(self.impact_agent, "_last_provider", None)
+                       or ("mcp_gpt5" if getattr(self.impact_agent, "mcp_gpt5_caller", None) else "deterministic"),
                 inputs={"recommendations_in": len(state.recommendations)},
                 outputs={"impact_summary": state.impact_summary},
             ))
@@ -472,11 +534,24 @@ class PlannerAgent:
             ctx.agent_run_log.append(self._stage_record(
                 stage="action_plan_report", agent=self.report_agent,
                 started_at=stage_start, t0=t,
-                method=("mcp_gpt5" if getattr(self.report_agent, "mcp_gpt5_caller", None) else "deterministic"),
+                # This stage mixes two independent sub-calls with different
+                # providers - the executive narrative (Azure OpenAI GPT-5
+                # deployment when configured, else deterministic) and the
+                # per-notebook code patches (Claude, only when findings
+                # target that notebook) - so report both explicitly rather
+                # than collapsing to one misleading "method".
+                method=getattr(self.report_agent, "_last_provider", "deterministic"),
                 inputs={"root_causes_in": len(state.root_causes),
                         "recommendations_in": len(state.recommendations)},
                 outputs={"suggested_fixes_count": len(state.final_report.get("suggested_fixes", [])),
-                         "apply_fix_payloads_count": len(state.final_report.get("apply_fix_payloads", []))},
+                         "apply_fix_payloads_count": len(state.final_report.get("apply_fix_payloads", [])),
+                         "narrative_provider": getattr(self.report_agent, "_last_provider", "deterministic"),
+                         "code_patches_generated": sum(
+                             1 for p in (state.final_report.get("code_patches") or {}).values()
+                             if p.get("has_issues")),
+                         "code_patches_no_issue": sum(
+                             1 for p in (state.final_report.get("code_patches") or {}).values()
+                             if not p.get("has_issues"))},
             ))
             stage_timings["report_seconds"] = round(perf_counter() - t, 3)
             await self._put(ctx, FINAL_REPORT, state.final_report)

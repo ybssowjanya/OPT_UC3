@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 import json
 import os
@@ -52,6 +50,12 @@ class BaseIntelligenceAgent:
 
     enrichment_keys: tuple = ()
 
+    # Per-agent output budget. Agents that enumerate many activities/relationships
+    # (e.g. dependency_lineage_agent) should override this with a higher value -
+    # a response that gets cut off mid-JSON is worse than a slower response.
+    # Can be overridden globally via LLM_MAX_TOKENS env var.
+    max_tokens: int = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
+
     def __init__(self, asset_loader: Optional[Callable] = None):
         self.asset_loader = asset_loader
 
@@ -98,34 +102,65 @@ class BaseIntelligenceAgent:
     def build_prompt(self, ctx: InvestigationContext, activities: list) -> str:
         raise NotImplementedError
 
-    def parse_response(self, ctx: InvestigationContext, raw_text: str) -> list[AgentFinding]:
-        
+    def parse_response(self, ctx: InvestigationContext, raw_text: str,
+                       truncated: bool = False) -> list[AgentFinding]:
+        """Parse the LLM's JSON output into findings.
+
+        `truncated` should be True when the provider's stop_reason indicates
+        the response was cut off before completion (e.g. hit max_tokens).
+        A truncated response is never valid JSON by construction, so we skip
+        straight to the parse-failure path rather than attempting json.loads
+        and printing a confusing decode error.
+        """
         if os.environ.get("DEBUG_RAW_RESPONSE"):
             print(f"\n--- RAW RESPONSE [{self.role_name}] ---\n{raw_text}\n--- END RAW RESPONSE ---\n")
 
-        cleaned = self._strip_markdown_fence(raw_text)
+        if not truncated:
+            cleaned = self._strip_markdown_fence(raw_text)
+            try:
+                data = json.loads(cleaned)
+            except (json.JSONDecodeError, TypeError) as e:
+                if os.environ.get("DEBUG_RAW_RESPONSE"):
+                    print(f"[{self.role_name}] JSON parse failed: {e}")
+                return self._parse_failure_finding(raw_text, reason=f"{type(e).__name__}: {e}")
 
-        try:
-            data = json.loads(cleaned)
-        except (json.JSONDecodeError, TypeError) as e:
-            if os.environ.get("DEBUG_RAW_RESPONSE"):
-                print(f"[{self.role_name}] JSON parse failed: {e}")
-            return [AgentFinding(
-                agent=self.role_name,
-                summary=raw_text[:500] if isinstance(raw_text, str) else "No structured output",
-                confidence=0.3,
-            )]
+            findings = []
+            for item in data if isinstance(data, list) else [data]:
+                findings.append(AgentFinding(
+                    agent=self.role_name,
+                    summary=item.get("summary", ""),
+                    confidence=float(item.get("confidence", 0.5)),
+                    evidence=item.get("evidence", {}),
+                    affected_activities=item.get("affected_activities", []),
+                ))
+            return findings
 
-        findings = []
-        for item in data if isinstance(data, list) else [data]:
-            findings.append(AgentFinding(
-                agent=self.role_name,
-                summary=item.get("summary", ""),
-                confidence=float(item.get("confidence", 0.5)),
-                evidence=item.get("evidence", {}),
-                affected_activities=item.get("affected_activities", []),
-            ))
-        return findings
+        if os.environ.get("DEBUG_RAW_RESPONSE"):
+            print(f"[{self.role_name}] response truncated (hit max_tokens) - "
+                  f"discarding as unparseable rather than fabricating a finding")
+        return self._parse_failure_finding(raw_text, reason="truncated: hit max_tokens before completion")
+
+    def _parse_failure_finding(self, raw_text: str, reason: str) -> list[AgentFinding]:
+        """A single, clearly-marked placeholder finding for an unparseable
+        response. `evidence.parse_error=True` lets downstream stages (in
+        particular EvidenceValidationAgent) recognize and exclude this from
+        the normal confidence-boost / verification path - it must never be
+        surfaced to the user as a real structural fault."""
+        return [AgentFinding(
+            agent=self.role_name,
+            summary=(
+                f"[{self.role_name}] produced no usable structured output "
+                f"({reason}). Raw response discarded from findings; see "
+                "agent_run_log for the full text."
+            ),
+            confidence=0.0,
+            evidence={
+                "parse_error": True,
+                "reason": reason,
+                "raw_response_preview": raw_text[:500] if isinstance(raw_text, str) else None,
+            },
+            status="rejected",
+        )]
 
     @staticmethod
     def _strip_markdown_fence(text: str) -> str:
@@ -162,7 +197,7 @@ class BaseIntelligenceAgent:
             "agent_class": type(self).__name__,
             "model": self.model,
             "provider": provider,
-            "max_tokens": 2000,
+            "max_tokens": self.max_tokens,
             "started_at": started_at,
             "ended_at": datetime.now(timezone.utc).isoformat(),
             "latency_seconds": round(perf_counter() - t0, 3),
@@ -238,11 +273,14 @@ class BaseIntelligenceAgent:
             if anthropic_ready():
                 provider = "anthropic"
                 raw_text = await self._call_anthropic(prompt)
+                truncated = self._last_call_meta.get("stop_reason") == "max_tokens"
                 if os.environ.get("DEBUG_RAW_RESPONSE"):
-                    print(f"\n[{self.role_name}] anthropic SDK returned {len(raw_text)} chars")
-                findings = self.parse_response(ctx, raw_text)
+                    print(f"\n[{self.role_name}] anthropic SDK returned {len(raw_text)} chars"
+                          f"{' (TRUNCATED - hit max_tokens)' if truncated else ''}")
+                findings = self.parse_response(ctx, raw_text, truncated=truncated)
                 self._record_run(ctx, prompt=prompt, raw_text=raw_text, findings=findings,
-                                 started_at=started_at, t0=t0, provider=provider)
+                                 started_at=started_at, t0=t0, provider=provider,
+                                 status="truncated" if truncated else "success")
                 return findings
 
             if not SDK_AVAILABLE:
@@ -284,7 +322,7 @@ class BaseIntelligenceAgent:
         client = anthropic.AsyncAnthropic()  
         response = await client.messages.create(
             model=self.model,
-            max_tokens=2000,
+            max_tokens=self.max_tokens,
             system=self.system_prompt,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -318,7 +356,3 @@ class BaseIntelligenceAgent:
             evidence={"deviation_pct": worst.deviation_pct, "raw": worst.raw},
             affected_activities=[worst.activity_name],
         )]
-
-
-
-

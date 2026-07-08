@@ -31,6 +31,29 @@ def severity_for(confidence: float) -> str:
     return "LOW"
 
 
+# Dashboards want a handful of distinct issues, not the full per-agent
+# finding dump (which routinely has 4-5 agents independently describing the
+# same underlying problem). root_causes is already the deduplicated,
+# synthesized view - one entry per distinct causal category - so that's the
+# source for the "structural faults" card, capped here as a display limit.
+MAX_STRUCTURAL_FAULTS = 5
+
+
+def _headline(text: Optional[str], max_chars: int = 140) -> str:
+    """First sentence of `text`, truncated to a dashboard-friendly length.
+    Falls back to a hard character truncation if there's no clean sentence
+    break (our generated descriptions are usually one long sentence)."""
+    if not text:
+        return ""
+    first = text.split(". ")[0].strip()
+    if len(first) > max_chars:
+        cut = first[:max_chars].rsplit(" ", 1)[0]
+        return cut.rstrip(",;: ") + "…"
+    if not first.endswith((".", "!", "?", "…")):
+        first += "."
+    return first
+
+
 def ui_health(health: Optional[str]) -> str:
     """Map stored health values to the dashboard's states."""
     return {"Healthy": "Ok", "Warning": "Warning", "Severe": "High",
@@ -339,6 +362,8 @@ class DashboardService:
             "investigation_id": investigation_id,
             "status": manifest.get("status"),
             "error": manifest.get("error"),
+            "skipped_reason": manifest.get("skipped_reason") or report.get("skipped_reason"),
+            "message": manifest.get("message") or report.get("message"),
             "item": {k: manifest.get(k) for k in
                      ("subscription_id", "service", "resource_group",
                       "workspace_name", "item_type", "item_name")},
@@ -387,6 +412,7 @@ class DashboardService:
             top = rcs[0]
             core_bottleneck = {
                 "category": top.get("category"),
+                "headline": _headline(top.get("description"), max_chars=200),
                 "description": top.get("description"),
                 "causal_chain": top.get("causal_chain"),
                 "supporting_findings": top.get("supporting_findings"),
@@ -404,14 +430,42 @@ class DashboardService:
             for r in recommendations
         ]
 
-        # -- impact agent output -------------
+        # -- impact agent output ---------------------------------------
+        # `summary` is always the short deterministic headline (see
+        # ImpactAgent.assess); `detailed_summary` is the optional long-form
+        # GPT-5 narrative for an expandable view, kept separate so it never
+        # displaces the one-liner a dashboard card actually wants.
         target_optimization_forecast = impact or None
 
-        # --  validated findings + derived severity ------
+        # -- compilation adjustment one-liner --------------------------
+        compilation_adjustment = report.get("compilation_adjustment")
+
+        # -- structural faults: deduplicated root causes, not raw findings -
+        # root_causes already merges every agent's overlapping findings into
+        # one entry per distinct causal category, so this is naturally
+        # dedup'd and typically 4-6 items instead of the 20+ raw findings in
+        # `validated`. Capped at MAX_STRUCTURAL_FAULTS as a display limit;
+        # the full raw finding list remains available via `all_findings`.
         structural_faults = []
+        for rc in rcs[:MAX_STRUCTURAL_FAULTS]:
+            conf = float(rc.get("confidence") or 0)
+            desc = rc.get("description") or ""
+            structural_faults.append({
+                "title": _headline(desc, max_chars=90),
+                "description": _headline(desc, max_chars=220),
+                "full_description": desc,
+                "category": rc.get("category"),
+                "severity": severity_for(conf),
+                "severity_rule": SEVERITY_RULE,
+                "confidence": conf,
+                "supporting_findings": rc.get("supporting_findings"),
+                "causal_chain": rc.get("causal_chain"),
+            })
+
+        all_findings = []
         for f in validated:
             conf = float(f.get("confidence") or 0)
-            structural_faults.append({
+            all_findings.append({
                 "title": f.get("summary"),
                 "severity": severity_for(conf),
                 "severity_rule": SEVERITY_RULE,
@@ -421,28 +475,44 @@ class DashboardService:
                 "evidence": f.get("evidence"),
                 "verified": f.get("verified", True),
             })
-        structural_faults.sort(
+        all_findings.sort(
             key=lambda x: ["CRITICAL", "HIGH", "MEDIUM", "LOW"].index(x["severity"]))
 
         
+        # NOTE: fix.target_activity is a free-text label that CONTAINS the
+        # real activity_name (e.g. "Bronze SynapseNotebook - df.count() Call"
+        # for activity_name "Bronze") - it is never an exact match, so we
+        # group by substring containment instead of equality.
         fixes_by_activity: dict[str, list] = {}
         for fix in (report.get("suggested_fixes") or []):
-            target = (fix or {}).get("target_activity") or "__pipeline__"
-            fixes_by_activity.setdefault(target, []).append(fix)
+            target = (fix or {}).get("target_activity") or ""
+            matched = [name for name in notebooks if name and name in target]
+            key = matched[0] if matched else (target or "__pipeline__")
+            fixes_by_activity.setdefault(key, []).append(fix)
         patches_by_activity: dict[str, list] = {}
         for p in (report.get("apply_fix_payloads") or []):
-            target = (p or {}).get("target_activity") or "__pipeline__"
-            patches_by_activity.setdefault(target, []).append(p)
+            target = (p or {}).get("target_activity") or ""
+            matched = [name for name in notebooks if name and name in target]
+            key = matched[0] if matched else (target or "__pipeline__")
+            patches_by_activity.setdefault(key, []).append(p)
 
+        code_patches = report.get("code_patches") or {}
         code_refactoring_plan = []
         for name, nb in notebooks.items():
+            patch = code_patches.get(name) or {}
+            has_issues = patch.get("has_issues", bool(fixes_by_activity.get(name)))
             code_refactoring_plan.append({
                 "activity_name": name,
                 "language": nb.get("language"),
                 "baseline_script": nb.get("source_code"),
                 "suggested_fixes": fixes_by_activity.get(name) or [],
-                "auto_generated_patch": patches_by_activity.get(name) or None,
-                "patch_available": bool(patches_by_activity.get(name)),
+                "has_issues": has_issues,
+                "auto_generated_patch": patch.get("patched_code"),
+                "patch_available": bool(patch.get("patched_code")),
+                "patch_explanation": patch.get("explanation") or (
+                    "No code-level issues identified for this notebook based "
+                    "on current evidence." if not has_issues else None
+                ),
             })
 
         return {
@@ -451,11 +521,14 @@ class DashboardService:
             "agents": agents,
             "agent_recommendation_analysis": {
                 "core_bottleneck": core_bottleneck,
+                "compilation_adjustment": compilation_adjustment,
                 "recommendations": recommendation_analysis,
                 "target_optimization_forecast": target_optimization_forecast,
             },
             "structural_faults": structural_faults,
             "structural_faults_count": len(structural_faults),
+            "all_findings": all_findings,
+            "all_findings_count": len(all_findings),
             "code_refactoring_plan": code_refactoring_plan,
             "root_causes": rcs,
             "trigger_payload": trigger.get("payload"),
