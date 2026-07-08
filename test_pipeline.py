@@ -251,9 +251,7 @@ async def call_claude(
             stop = response.stop_reason
             USAGE.add(inp, out)
 
-            # Stop reason is the critical signal:
-            # "end_turn"   → clean finish, JSON should be complete
-            # "max_tokens" → cut off, JSON likely truncated
+            
             status = "⚠ TRUNCATED" if stop == "max_tokens" else "✓"
             print(f"  [{label}] {status}  "
                   f"in={inp} out={out} stop={stop} latency={latency}s")

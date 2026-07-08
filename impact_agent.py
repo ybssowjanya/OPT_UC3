@@ -19,8 +19,7 @@ class ImpactAgent:
 
     def __init__(self, mcp_gpt5_caller: Optional[Callable] = None):
         # mcp_gpt5_caller(system_prompt, user_prompt) -> str
-        # Pluggable so the actual transport (Azure OpenAI today, MCP later) lives
-        # outside this class - see azure_openai_client.azure_gpt5_caller.
+        
         self.mcp_gpt5_caller = mcp_gpt5_caller
         self._last_call_meta: dict = {}
         self._last_provider: str = "deterministic"
@@ -66,11 +65,8 @@ class ImpactAgent:
                 "risk_level": self.assess_risk_level(rec),
             })
 
-        # `summary` is ALWAYS this short, deterministic one-liner - this is
-        # what dashboards should show as the headline (e.g. "Estimated ~78%
-        # processing decrease..."). The optional GPT-5 narrative below is
-        # exposed separately as `detailed_summary` for an expandable view,
-        # rather than overwriting the headline with a multi-paragraph essay.
+        # `summary`
+    
         headline = self.generate_impact_summary(ctx, items)
         detailed_summary = None
         summary_error = None
@@ -87,8 +83,7 @@ class ImpactAgent:
                 self._last_call_meta = dict(azure_openai_client.last_call_meta)
             except Exception as e:
                 # Fall back to the deterministic summary rather than failing
-                # the whole investigation over an impact-narrative call, but
-                # record the failure instead of silently swallowing it.
+                
                 summary_error = f"{type(e).__name__}: {e}"
                 self._last_provider = "deterministic_fallback"
                 self._last_call_meta = {"error": summary_error}

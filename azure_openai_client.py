@@ -35,16 +35,10 @@ def _get_client() -> "AsyncAzureOpenAI":
         )
     return _client
 
-
-# Stashed on the module after every call so the caller (ImpactAgent /
-# ActionPlanReportAgent) can pull real token usage into their _last_call_meta
-# instead of leaving it null in the investigation metadata.
 last_call_meta: dict = {}
 
 
 async def azure_gpt5_caller(system_prompt: str, user_prompt: str) -> str:
-    """Matches the mcp_gpt5_caller(system_prompt, user_prompt) -> str contract
-    already expected by ImpactAgent and ActionPlanReportAgent."""
     global last_call_meta
     client = _get_client()
     deployment = os.environ["AZURE_OPENAI_GPT5_DEPLOYMENT"]  # deployment name, not the model name

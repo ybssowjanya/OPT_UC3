@@ -31,18 +31,10 @@ def severity_for(confidence: float) -> str:
     return "LOW"
 
 
-# Dashboards want a handful of distinct issues, not the full per-agent
-# finding dump (which routinely has 4-5 agents independently describing the
-# same underlying problem). root_causes is already the deduplicated,
-# synthesized view - one entry per distinct causal category - so that's the
-# source for the "structural faults" card, capped here as a display limit.
 MAX_STRUCTURAL_FAULTS = 5
 
 
 def _headline(text: Optional[str], max_chars: int = 140) -> str:
-    """First sentence of `text`, truncated to a dashboard-friendly length.
-    Falls back to a hard character truncation if there's no clean sentence
-    break (our generated descriptions are usually one long sentence)."""
     if not text:
         return ""
     first = text.split(". ")[0].strip()
@@ -55,14 +47,11 @@ def _headline(text: Optional[str], max_chars: int = 140) -> str:
 
 
 def ui_health(health: Optional[str]) -> str:
-    """Map stored health values to the dashboard's states."""
     return {"Healthy": "Ok", "Warning": "Warning", "Severe": "High",
             "Critical": "High"}.get(health or "", "Unknown")
 
 
 class DashboardService:
-    """One instance per process. Stores are created per subscription on
-    demand and cached."""
 
     def __init__(self):
         self._stores: dict[str, TelemetryStore] = {}
@@ -165,8 +154,6 @@ class DashboardService:
 
         rows: list[dict] = []
         for t in types:
-            # each item is a FOLDER of {run_id}.json deviation outputs;
-            # tolerate direct {item_name}.json files as well
             folders, files = await store.list_children(f"{base}/{t}/")
             names = sorted(
                 {f.rsplit("/", 1)[-1][:-5] for f in files if f.endswith(".json")}
@@ -235,9 +222,7 @@ class DashboardService:
     async def _optimization_action(self, subscription_id: str, service: str,
                                    workspace: str, item_type: str, item_name: str,
                                    health_state: str) -> dict:
-        """fix when a completed investigation with recommendations
-        exists for this item; analyze_available when unhealthy; otherwise
-        no_action_needed."""
+        
         latest = await self.latest_investigation(
             subscription_id, service, workspace, item_type, item_name,
             completed_only=True)
@@ -431,21 +416,14 @@ class DashboardService:
         ]
 
         # -- impact agent output ---------------------------------------
-        # `summary` is always the short deterministic headline (see
-        # ImpactAgent.assess); `detailed_summary` is the optional long-form
-        # GPT-5 narrative for an expandable view, kept separate so it never
-        # displaces the one-liner a dashboard card actually wants.
+        
         target_optimization_forecast = impact or None
 
         # -- compilation adjustment one-liner --------------------------
         compilation_adjustment = report.get("compilation_adjustment")
 
         # -- structural faults: deduplicated root causes, not raw findings -
-        # root_causes already merges every agent's overlapping findings into
-        # one entry per distinct causal category, so this is naturally
-        # dedup'd and typically 4-6 items instead of the 20+ raw findings in
-        # `validated`. Capped at MAX_STRUCTURAL_FAULTS as a display limit;
-        # the full raw finding list remains available via `all_findings`.
+        
         structural_faults = []
         for rc in rcs[:MAX_STRUCTURAL_FAULTS]:
             conf = float(rc.get("confidence") or 0)

@@ -82,12 +82,7 @@ MAX_PLANNER_ROUNDS = 3  # safety-net round ceiling, per your earlier architectur
 
 
 class PlannerAgent:
-    """
-    Tools:
-      load_baseline_deviation, load_recent_runs, load_pipeline_definition,
-      load_asset, search_knowledge_base, dispatch_intelligence_agents,
-      save_investigation_state
-    """
+    
 
     def __init__(self, storage_account: Optional[str] = None,
                  persistence: Optional[BaseDocumentStore] = None,
@@ -104,10 +99,7 @@ class PlannerAgent:
         self.root_cause_agent = RootCauseAgent()
         self.recommendation_agent = RecommendationAgent()
 
-        # Azure OpenAI (GPT-5 deployment) is used for the impact/report
-        # stages when AZURE_OPENAI_* env vars are configured; otherwise both
-        # agents fall back to their deterministic (pure-Python) path, which
-        # is what they've always done when mcp_gpt5_caller is None.
+        
         gpt5_caller = azure_gpt5_caller if azure_gpt5_available() else None
         self.impact_agent = ImpactAgent(mcp_gpt5_caller=gpt5_caller)
         self.report_agent = ActionPlanReportAgent(mcp_gpt5_caller=gpt5_caller)
@@ -177,8 +169,7 @@ class PlannerAgent:
             selected.update(agents)
 
         if not selected:
-            # pipeline_health is Warning/Severe but no single activity crossed
-            # the degraded threshold on its own - still worth a baseline look.
+    
             selected.add(AgentRole.RUNTIME_INTELLIGENCE)
 
         if len(selected) > 1:

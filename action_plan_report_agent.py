@@ -5,7 +5,6 @@ Model: GPT-5 (MCP tool, same rationale as Impact Agent)
 Tools: generate_final_report, create_action_roadmap, generate_suggested_fixes,
        prepare_apply_fix_payload, generate_code_patches
 it produces the investigation report and apply-fix payloads shown in the diagram's
-"suggested fixes" / "Report" / "apply fixes" outputs.
 """
 from __future__ import annotations
 import json
@@ -107,12 +106,6 @@ class ActionPlanReportAgent:
         }
 
     # ---- compilation adjustment one-liner -----------------------------
-
-    # (pattern, short phrase) - matched against patched_code + explanation
-    # text for every notebook that actually got a code patch. Order matters:
-    # first match wins for a given pattern group, and phrases are deduped
-    # and capped so the sentence stays a genuine one-liner regardless of how
-    # many notebooks were patched.
     _PATCH_PHRASE_PATTERNS = [
         (r"inferSchema.*false|schema\(", "enforced explicit schema-on-read"),
         (r"\.cache\(\)|\.persist\(", "introduced DataFrame caching"),
@@ -125,10 +118,6 @@ class ActionPlanReportAgent:
     ]
 
     def generate_compilation_adjustment(self, code_patches: dict) -> str:
-        """One-line, dashboard-ready summary of what the auto-generated code
-        patches actually changed - deterministic (regex over the patches
-        already generated) rather than another LLM call, so it costs nothing
-        extra and can never drift from what was actually patched."""
         patched_count = sum(1 for p in code_patches.values() if p.get("has_issues"))
         if patched_count == 0:
             return "No code-level adjustments were required; findings were infrastructure/configuration related."
