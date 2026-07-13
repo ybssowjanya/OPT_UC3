@@ -221,6 +221,15 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
 #     except Exception as e:
 #         raise _http(e)
 
+@app.post("/post-cost-investigation")
+async def post_cost_investigation(payload: dict):
+
+    planner = PlannerAgent()
+
+    state = await planner.run_cost_investigation(payload)
+
+    return state.final_report
+
 
 @app.get("/api/health")
 def health():

@@ -39,15 +39,76 @@ class EvidenceValidationAgent:
                 existing.evidence.update(f.evidence)
         return list(seen.values())
 
-    def validate_against_original_deviation(self, ctx: InvestigationContext, finding: AgentFinding) -> bool:
-        known_activity_names = {a.activity_name for a in ctx.activities}
-        degraded_names = {a.activity_name for a in ctx.degraded_activities()}
+    def validate_against_original_deviation(
+        self,
+        ctx: InvestigationContext,
+        finding: AgentFinding,
+    ) -> bool:
+        """
+        Validates whether a finding is applicable to the
+        original investigation.
+
+        Runtime investigations are validated against
+        degraded activities.
+
+        Workspace-level investigations (Cost Intelligence)
+        are validated using workspace metadata instead.
+        """
+
+        #
+        # Workspace-level investigation
+        #
+        print(f"Validating finding {finding.agent} against original deviation for investigation type {ctx.item_type}")
+        if finding.agent == "cost_intelligence_agent":
+            payload = ctx.raw_payload
+
+            workspace = (
+                payload.get("workspace_name")
+                or payload.get("factory_name")
+                or payload.get("_workspace_name")
+                or ctx.workspace_name
+            )
+
+            if not workspace:
+                return False
+
+            if not finding.affected_activities:
+                return True
+
+            return any(
+                workspace.lower() in activity.lower()
+                for activity in finding.affected_activities
+            )
+
+        #
+        # Existing runtime validation
+        #
+        known_activity_names = {
+            a.activity_name
+            for a in ctx.activities
+        }
+
+        degraded_names = {
+            a.activity_name
+            for a in ctx.degraded_activities()
+        }
+
         if not finding.affected_activities:
-            return True  # pipeline-level finding, nothing to check
-       
-        refs_known = any(n in known_activity_names for n in finding.affected_activities)
-        refs_degraded = any(n in degraded_names for n in finding.affected_activities)
-        return refs_known and (refs_degraded or not degraded_names)
+            return True
+
+        refs_known = any(
+            n in known_activity_names
+            for n in finding.affected_activities
+        )
+
+        refs_degraded = any(
+            n in degraded_names
+            for n in finding.affected_activities
+        )
+
+        return refs_known and (
+            refs_degraded or not degraded_names
+        )
 
     def score_evidence_confidence(self, ctx: InvestigationContext, finding: AgentFinding,
                                    corroborating_count: int) -> float:
@@ -61,6 +122,10 @@ class EvidenceValidationAgent:
         return bool((f.evidence or {}).get("parse_error"))
 
     async def validate(self, ctx: InvestigationContext, findings: list[AgentFinding]) -> list[AgentFinding]:
+
+
+        print("Validating findings against original deviation...")
+        print("Incoming findings:", len(findings))
 
         real_findings = []
         for f in findings:
@@ -78,6 +143,16 @@ class EvidenceValidationAgent:
 
         validated: list[AgentFinding] = []
         for f in merged:
+            print("\nValidating:", f.agent)
+            print("Confidence:", f.confidence)
+            print("Affected:", f.affected_activities)
+
+            valid = self.validate_against_original_deviation(ctx, f)
+
+            print("validate_against_original_deviation =", valid)
+
+            if not valid:
+                print("Rejected due to validation")
             if not self.validate_against_original_deviation(ctx, f):
                 f.status = "rejected"
                 continue

@@ -2,6 +2,8 @@
 uc3final/
 venv/
 .venv/
+uv.lock
+
 
 # Python
 __pycache__/
