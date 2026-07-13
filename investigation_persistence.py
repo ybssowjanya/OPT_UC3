@@ -64,14 +64,27 @@ class BlobDocumentStore(BaseDocumentStore):
                 "azure-storage-blob is required for investigation persistence "
             ) from e
 
-        conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        account_key = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
         account_url = f"https://{self.storage_account}.blob.core.windows.net"
+
+        # Per-account key override: {"<storage_account>": "<key>"}
+        key_map_raw = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY_MAP")
+        per_account_key = None
+        if key_map_raw:
+            try:
+                per_account_key = json.loads(key_map_raw).get(self.storage_account)
+            except json.JSONDecodeError as e:
+                raise PersistenceError(
+                    f"AZURE_STORAGE_ACCOUNT_KEY_MAP env var is set but is not valid JSON: {e}"
+                ) from e
+
+        conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        account_key = per_account_key or os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
+
         try:
-            if conn_str:
-                service = BlobServiceClient.from_connection_string(conn_str)
-            elif account_key:
+            if account_key:
                 service = BlobServiceClient(account_url=account_url, credential=account_key)
+            elif conn_str:
+                service = BlobServiceClient.from_connection_string(conn_str)
             else:
                 from azure.identity import DefaultAzureCredential
                 service = BlobServiceClient(account_url=account_url,
@@ -101,7 +114,6 @@ class BlobDocumentStore(BaseDocumentStore):
             raise PersistenceError(
                 f"Authentication to storage account '{self.storage_account}' failed: {e}"
             ) from e
-
     # ---- write ----------------------------------------------------------
 
     def _put_sync(self, service: str, investigation_id: str,

@@ -72,15 +72,27 @@ class TelemetryStore:
         if self._container is not None:
             return self._container
 
-        conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        account_key = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
         account_url = f"https://{self.storage_account}.blob.core.windows.net"
+        # Per-account key override: {"<storage_account>": "<key>"}
+        key_map_raw = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY_MAP")
+        per_account_key = None
+        if key_map_raw:
+            try:
+                per_account_key = json.loads(key_map_raw).get(self.storage_account)
+            except json.JSONDecodeError as e:
+                raise TelemetryFetchError(
+                    f"AZURE_STORAGE_ACCOUNT_KEY_MAP env var is set but is not valid JSON: {e}"
+                ) from e
+
+
+        conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        account_key = per_account_key or os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
 
         try:
-            if conn_str:
-                service = BlobServiceClient.from_connection_string(conn_str)
-            elif account_key:
+            if account_key:
                 service = BlobServiceClient(account_url=account_url, credential=account_key)
+            elif conn_str:
+                service = BlobServiceClient.from_connection_string(conn_str)
             else:
                 try:
                     from azure.identity import DefaultAzureCredential
