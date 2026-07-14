@@ -40,6 +40,7 @@ from root_cause_agent import RootCauseAgent
 from recommendation_agent import RecommendationAgent
 from impact_agent import ImpactAgent
 from action_plan_report_agent import ActionPlanReportAgent
+from azure_openai_client import azure_gpt5_available, azure_gpt5_caller
 
 ACTIVITY_TYPE_TO_AGENTS: dict[str, list[AgentRole]] = {
     # Notebook/code activities -> all three focused code agents + runtime
@@ -82,12 +83,7 @@ MAX_PLANNER_ROUNDS = 3  # safety-net round ceiling, per your earlier architectur
 
 
 class PlannerAgent:
-    """
-    Tools:
-      load_baseline_deviation, load_recent_runs, load_pipeline_definition,
-      load_asset, search_knowledge_base, dispatch_intelligence_agents,
-      save_investigation_state
-    """
+    
 
     def __init__(self, storage_account: Optional[str] = None,
                  persistence: Optional[BaseDocumentStore] = None,
@@ -103,8 +99,11 @@ class PlannerAgent:
         self.evidence_validation_agent = EvidenceValidationAgent()
         self.root_cause_agent = RootCauseAgent()
         self.recommendation_agent = RecommendationAgent()
-        self.impact_agent = ImpactAgent()
-        self.report_agent = ActionPlanReportAgent()
+
+        
+        gpt5_caller = azure_gpt5_caller if azure_gpt5_available() else None
+        self.impact_agent = ImpactAgent(mcp_gpt5_caller=gpt5_caller)
+        self.report_agent = ActionPlanReportAgent(mcp_gpt5_caller=gpt5_caller)
 
         self._sub_agent_pool = {
             AgentRole.RUNTIME_INTELLIGENCE: RuntimeIntelligenceAgent(asset_loader),
@@ -189,8 +188,7 @@ class PlannerAgent:
             selected.update(agents)
 
         if not selected:
-            # pipeline_health is Warning/Severe but no single activity crossed
-            # the degraded threshold on its own - still worth a baseline look.
+    
             selected.add(AgentRole.RUNTIME_INTELLIGENCE)
 
         if len(selected) > 1:

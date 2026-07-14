@@ -104,14 +104,7 @@ class BaseIntelligenceAgent:
 
     def parse_response(self, ctx: InvestigationContext, raw_text: str,
                        truncated: bool = False) -> list[AgentFinding]:
-        """Parse the LLM's JSON output into findings.
-
-        `truncated` should be True when the provider's stop_reason indicates
-        the response was cut off before completion (e.g. hit max_tokens).
-        A truncated response is never valid JSON by construction, so we skip
-        straight to the parse-failure path rather than attempting json.loads
-        and printing a confusing decode error.
-        """
+        
         if os.environ.get("DEBUG_RAW_RESPONSE"):
             print(f"\n--- RAW RESPONSE [{self.role_name}] ---\n{raw_text}\n--- END RAW RESPONSE ---\n")
 
@@ -141,11 +134,7 @@ class BaseIntelligenceAgent:
         return self._parse_failure_finding(raw_text, reason="truncated: hit max_tokens before completion")
 
     def _parse_failure_finding(self, raw_text: str, reason: str) -> list[AgentFinding]:
-        """A single, clearly-marked placeholder finding for an unparseable
-        response. `evidence.parse_error=True` lets downstream stages (in
-        particular EvidenceValidationAgent) recognize and exclude this from
-        the normal confidence-boost / verification path - it must never be
-        surfaced to the user as a real structural fault."""
+        
         return [AgentFinding(
             agent=self.role_name,
             summary=(
@@ -285,10 +274,7 @@ class BaseIntelligenceAgent:
 
             if not SDK_AVAILABLE:
                 raise RuntimeError(
-                    f"{self.role_name}: no LLM provider available. Set ANTHROPIC_API_KEY "
-                    "(pip install anthropic), or LLM_PROVIDER=gemini + GEMINI_API_KEY, "
-                    "or install claude_agent_sdk. Heuristic fallbacks are disabled - "
-                    "the pipeline fails loudly instead of fabricating findings."
+                    f"{self.role_name}: no LLM provider available."
                 )
             provider = "claude_agent_sdk"
             options = ClaudeAgentOptions(

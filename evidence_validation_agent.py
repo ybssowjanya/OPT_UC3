@@ -135,7 +135,7 @@ class EvidenceValidationAgent:
             real_findings.append(f)
 
         agents_by_activity: dict[str, set] = {}
-        for f in real_findings:
+        for f in findings:
             for act in (f.affected_activities or ["__pipeline_level__"]):
                 agents_by_activity.setdefault(act, set()).add(f.agent)
 
