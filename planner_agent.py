@@ -34,8 +34,9 @@ from sub_agents.python_intelligence_agent import PythonIntelligenceAgent
 from sub_agents.spark_intelligence_agent import SparkIntelligenceAgent
 from sub_agents.configuration_agent import ConfigurationAgent
 from sub_agents.dependency_lineage_agent import DependencyLineageAgent
+from sub_agents.cost_intelligence_agent import CostIntelligenceAgent
 from evidence_validation_agent import EvidenceValidationAgent
-from root_cause_agent import RootCauseAgent
+from root_cause_agent import RootCauseAgent 
 from recommendation_agent import RecommendationAgent
 from impact_agent import ImpactAgent
 from action_plan_report_agent import ActionPlanReportAgent
@@ -111,11 +112,20 @@ class PlannerAgent:
             AgentRole.SPARK_INTELLIGENCE:   SparkIntelligenceAgent(asset_loader),
             AgentRole.CONFIGURATION:        ConfigurationAgent(asset_loader),
             AgentRole.DEPENDENCY_LINEAGE:   DependencyLineageAgent(asset_loader),
+            AgentRole.COST_INTELLIGENCE:    CostIntelligenceAgent(asset_loader)
         }
 
     # ---- tools -----------------------------------------------------
 
-    def load_baseline_deviation(self, payload: dict) -> InvestigationContext:
+    def load_baseline_deviation(
+        self,
+        payload: dict,
+        investigation_type: str = "runtime",
+    ) -> InvestigationContext:
+
+        if investigation_type == "cost":
+            return InvestigationContext.from_cost_payload(payload)
+
         return InvestigationContext.from_deviation_payload(payload)
 
     async def load_recent_runs(self, ctx: InvestigationContext) -> list[dict]:
@@ -158,6 +168,15 @@ class PlannerAgent:
         # small, noisy percentage swings on short-duration activities and does
         # not represent an actual production issue worth root-causing).
         if ctx.pipeline_health == "Healthy":
+            return selected
+        
+        # Cost investigation
+        payload = ctx.raw_payload
+
+        if payload.get("deviation") is not None and (
+            payload.get("baseline_monthly_cost") is not None
+        ):
+            selected.add(AgentRole.COST_INTELLIGENCE)
             return selected
 
         degraded = ctx.degraded_activities()
@@ -365,7 +384,10 @@ class PlannerAgent:
         try:
             # ---- MANDATORY ENRICHMENT (before any agent dispatch) ------
             t = perf_counter()
-            await TelemetryEnricher(store).enrich(ctx)
+            if ctx.investigation_type != "cost":
+                await TelemetryEnricher(store).enrich(ctx)
+            else:
+                ctx.enriched = True
             stage_timings["enrichment_seconds"] = round(perf_counter() - t, 3)
             await self._put(ctx, ENRICHMENT, ctx.enrichment)
             await self.save_investigation_state(state, "context_enriched")
@@ -508,8 +530,7 @@ class PlannerAgent:
             ctx.agent_run_log.append(self._stage_record(
                 stage="impact", agent=self.impact_agent,
                 started_at=stage_start, t0=t,
-                method=getattr(self.impact_agent, "_last_provider", None)
-                       or ("mcp_gpt5" if getattr(self.impact_agent, "mcp_gpt5_caller", None) else "deterministic"),
+                method=("mcp_gpt5" if getattr(self.impact_agent, "mcp_gpt5_caller", None) else "deterministic"),
                 inputs={"recommendations_in": len(state.recommendations)},
                 outputs={"impact_summary": state.impact_summary},
             ))
@@ -525,24 +546,11 @@ class PlannerAgent:
             ctx.agent_run_log.append(self._stage_record(
                 stage="action_plan_report", agent=self.report_agent,
                 started_at=stage_start, t0=t,
-                # This stage mixes two independent sub-calls with different
-                # providers - the executive narrative (Azure OpenAI GPT-5
-                # deployment when configured, else deterministic) and the
-                # per-notebook code patches (Claude, only when findings
-                # target that notebook) - so report both explicitly rather
-                # than collapsing to one misleading "method".
-                method=getattr(self.report_agent, "_last_provider", "deterministic"),
+                method=("mcp_gpt5" if getattr(self.report_agent, "mcp_gpt5_caller", None) else "deterministic"),
                 inputs={"root_causes_in": len(state.root_causes),
                         "recommendations_in": len(state.recommendations)},
                 outputs={"suggested_fixes_count": len(state.final_report.get("suggested_fixes", [])),
-                         "apply_fix_payloads_count": len(state.final_report.get("apply_fix_payloads", [])),
-                         "narrative_provider": getattr(self.report_agent, "_last_provider", "deterministic"),
-                         "code_patches_generated": sum(
-                             1 for p in (state.final_report.get("code_patches") or {}).values()
-                             if p.get("has_issues")),
-                         "code_patches_no_issue": sum(
-                             1 for p in (state.final_report.get("code_patches") or {}).values()
-                             if not p.get("has_issues"))},
+                         "apply_fix_payloads_count": len(state.final_report.get("apply_fix_payloads", []))},
             ))
             stage_timings["report_seconds"] = round(perf_counter() - t, 3)
             await self._put(ctx, FINAL_REPORT, state.final_report)
@@ -558,6 +566,201 @@ class PlannerAgent:
             self._ended_at = datetime.now(timezone.utc).isoformat()
             await self._flush_live_files(state)
             raise
+
+    async def run_cost_investigation(
+        self,
+        cost_payload: dict,
+        investigation_id: Optional[str] = None,
+    ) -> InvestigationState:
+            ctx = self.load_baseline_deviation(
+                cost_payload,
+                investigation_type="cost",
+            )
+            state = InvestigationState(context=ctx)
+            print("[run_cost_investigation] investigation_id:", investigation_id)
+
+            # ---- investigation identity + storage --------------------------
+        
+            self.investigation_id = investigation_id or self.new_investigation_id()
+            started_at = datetime.now(timezone.utc).isoformat()
+            self._t0 = perf_counter()
+            stage_timings: dict[str, float] = {}
+
+            account = resolve_storage_account(ctx.subscription_id, self.storage_account)
+            store = TelemetryStore(account)
+            if self.persistence is not None:          
+                self.document_store = self.persistence
+            else:
+                self.document_store = build_document_store(telemetry_store=store)
+
+            # ---- per-investigation folder: separate file per artifact ------
+            # investigations/{service}/{investigation_id}/*.json
+            self._status = "running"
+            self._error = None
+            self._started_at = started_at
+            self._ended_at = None
+            self._skipped_reason = None
+            self._message = None
+            self.stage_timings = stage_timings
+            self.checkpoints: list[dict] = []
+            self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
+
+            await self._put(ctx, TRIGGER_PAYLOAD, {
+                "investigation_id": self.investigation_id,
+                "received_at": started_at,
+                "subscription_id": ctx.subscription_id,
+                "service": ctx.service,
+                "resource_group": ctx.resource_group,
+                "workspace_name": ctx.workspace_name,
+                "item_type": ctx.item_type,
+                "item_name": ctx.item_name,
+                "payload": ctx.raw_payload,
+            })
+
+            await self.save_investigation_state(state, "context_loaded")
+
+            try:
+                # ---- MANDATORY ENRICHMENT (before any agent dispatch) ------
+                ctx.enriched = True
+                ctx.enrichment = {}
+
+                await self._put(ctx, ENRICHMENT, {})
+                await self.save_investigation_state(state, "cost_context_ready")
+
+                # ---- intelligence agent rounds ------------------------------
+                t = perf_counter()
+                cost_agent = self._sub_agent_pool[AgentRole.COST_INTELLIGENCE]
+
+                findings = await cost_agent.investigate(ctx)
+
+                state.findings.extend(findings)
+
+                state.dispatched_agents.append(
+                    AgentRole.COST_INTELLIGENCE.value
+                )
+
+                await self.save_investigation_state(
+                    state,
+                    "cost_agent_complete",
+                )
+                stage_timings["intelligence_agents_seconds"] = round(perf_counter() - t, 3)
+                await self._put(ctx, FINDINGS, [f.to_dict() for f in state.findings])
+
+                # ---- Evidence Validation Agent - strict "verified" gatekeeper --
+                t = perf_counter()
+                stage_start = datetime.now(timezone.utc).isoformat()
+                pre = [(f.agent, f.summary, f.confidence) for f in state.findings]
+                state.validated_findings = await self.evidence_validation_agent.validate(ctx, state.findings)
+                print("Before Evidence Validation")
+                print("Findings Count :", len(state.findings))
+                for f in state.findings:
+                    print("--------------------------------")
+                    print("Agent      :", f.agent)
+                    print("Confidence :", f.confidence)
+                    print("Status     :", f.status)
+                    print("Affected   :", f.affected_activities)
+                verified_keys = {(f.agent, f.summary) for f in state.validated_findings}
+                ctx.agent_run_log.append(self._stage_record(
+                    stage="evidence_validation", agent=self.evidence_validation_agent,
+                    started_at=stage_start, t0=t, method="deterministic",
+                    inputs={
+                        "findings_in": len(pre),
+                        "findings_by_agent": {a: sum(1 for x in pre if x[0] == a)
+                                            for a in {x[0] for x in pre}},
+                        "min_confidence_to_verify": _EV_MIN_CONFIDENCE(),
+                    },
+                    outputs={
+                        "validated_count": len(state.validated_findings),
+                        "rejected_count": len(pre) - len(state.validated_findings),
+                        "decisions": [
+                            {"agent": a, "summary": s[:120], "confidence_in": c,
+                            "verified": (a, s) in verified_keys}
+                            for a, s, c in pre
+                        ],
+                        "validated_findings": [f.to_dict() for f in state.validated_findings],
+                    },
+                ))
+                stage_timings["evidence_validation_seconds"] = round(perf_counter() - t, 3)
+                await self._put(ctx, VALIDATED_FINDINGS,
+                                [f.to_dict() for f in state.validated_findings])
+                await self.save_investigation_state(state, "evidence_validated")
+
+                # ---- Root Cause Agent ------------------------------------------
+                t = perf_counter()
+                stage_start = datetime.now(timezone.utc).isoformat()
+                state.root_causes = await self.root_cause_agent.analyze(ctx, state.validated_findings)
+                ctx.agent_run_log.append(self._stage_record(
+                    stage="root_cause", agent=self.root_cause_agent,
+                    started_at=stage_start, t0=t,
+                    inputs={"validated_findings_in": len(state.validated_findings)},
+                    outputs={"root_causes_count": len(state.root_causes),
+                            "root_causes": [asdict(rc) for rc in state.root_causes]},
+                ))
+                stage_timings["root_cause_seconds"] = round(perf_counter() - t, 3)
+                await self._put(ctx, ROOT_CAUSES, [asdict(rc) for rc in state.root_causes])
+                await self.save_investigation_state(state, "root_cause_complete")
+
+                # ---- Recommendation & Validation Agent -------------------------
+                t = perf_counter()
+                stage_start = datetime.now(timezone.utc).isoformat()
+                state.recommendations = await self.recommendation_agent.generate(ctx, state.root_causes)
+                ctx.agent_run_log.append(self._stage_record(
+                    stage="recommendation", agent=self.recommendation_agent,
+                    started_at=stage_start, t0=t,
+                    inputs={"root_causes_in": len(state.root_causes)},
+                    outputs={"recommendations_count": len(state.recommendations),
+                            "recommendations": [asdict(r) for r in state.recommendations],
+                            "scores": [{"title": r.title,
+                                        "score": self.recommendation_agent.score_recommendation(r)}
+                                        for r in state.recommendations]},
+                ))
+                stage_timings["recommendation_seconds"] = round(perf_counter() - t, 3)
+                await self._put(ctx, RECOMMENDATIONS, [asdict(r) for r in state.recommendations])
+                await self.save_investigation_state(state, "recommendations_generated")
+
+                # ---- Impact Agent ----------------------------------------------
+                t = perf_counter()
+                stage_start = datetime.now(timezone.utc).isoformat()
+                state.impact_summary = await self.impact_agent.assess(ctx, state.recommendations)
+                ctx.agent_run_log.append(self._stage_record(
+                    stage="impact", agent=self.impact_agent,
+                    started_at=stage_start, t0=t,
+                    method=("mcp_gpt5" if getattr(self.impact_agent, "mcp_gpt5_caller", None) else "deterministic"),
+                    inputs={"recommendations_in": len(state.recommendations)},
+                    outputs={"impact_summary": state.impact_summary},
+                ))
+                stage_timings["impact_seconds"] = round(perf_counter() - t, 3)
+                await self._put(ctx, IMPACT, state.impact_summary)
+                await self.save_investigation_state(state, "impact_assessed")
+
+                # ---- Action Plan & Report Agent --------------------------------
+                t = perf_counter()
+                stage_start = datetime.now(timezone.utc).isoformat()
+                state.final_report = await self.report_agent.generate(state)
+                state.final_report["investigation_id"] = self.investigation_id
+                ctx.agent_run_log.append(self._stage_record(
+                    stage="action_plan_report", agent=self.report_agent,
+                    started_at=stage_start, t0=t,
+                    method=("mcp_gpt5" if getattr(self.report_agent, "mcp_gpt5_caller", None) else "deterministic"),
+                    inputs={"root_causes_in": len(state.root_causes),
+                            "recommendations_in": len(state.recommendations)},
+                    outputs={"suggested_fixes_count": len(state.final_report.get("suggested_fixes", [])),
+                            "apply_fix_payloads_count": len(state.final_report.get("apply_fix_payloads", []))},
+                ))
+                stage_timings["report_seconds"] = round(perf_counter() - t, 3)
+                await self._put(ctx, FINAL_REPORT, state.final_report)
+
+                self._status = "completed"
+                self._ended_at = datetime.now(timezone.utc).isoformat()
+                await self.save_investigation_state(state, "report_complete")
+                return state
+
+            except Exception as e:
+                self._status = "failed"
+                self._error = f"{type(e).__name__}: {e}"
+                self._ended_at = datetime.now(timezone.utc).isoformat()
+                await self._flush_live_files(state)
+                raise
 
     def _followup_agents(self, new_findings: list[AgentFinding], already_dispatched: list[str]) -> set[AgentRole]:
         followups: set[AgentRole] = set()

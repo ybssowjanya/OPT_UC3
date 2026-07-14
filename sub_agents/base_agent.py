@@ -50,6 +50,10 @@ class BaseIntelligenceAgent:
 
     enrichment_keys: tuple = ()
 
+    # Per-agent output budget. Agents that enumerate many activities/relationships
+    # (e.g. dependency_lineage_agent) should override this with a higher value -
+    # a response that gets cut off mid-JSON is worse than a slower response.
+    # Can be overridden globally via LLM_MAX_TOKENS env var.
     max_tokens: int = int(os.environ.get("LLM_MAX_TOKENS", "4096"))
 
     def __init__(self, asset_loader: Optional[Callable] = None):
