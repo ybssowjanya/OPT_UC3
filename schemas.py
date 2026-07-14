@@ -19,6 +19,7 @@ class AgentRole(str, Enum):
     CODE_INTELLIGENCE = "code_intelligence_agent"
     PYTHON_INTELLIGENCE = "python_intelligence_agent"
     SPARK_INTELLIGENCE = "spark_intelligence_agent"
+    COST_INTELLIGENCE = "cost_intelligence"
     CONFIGURATION = "configuration_agent"
     DEPENDENCY_LINEAGE = "dependency_lineage_agent"
     COST_ANALYSIS = "cost_analysis_agent"
@@ -74,7 +75,7 @@ class InvestigationContext:
     pipeline_deviation_seconds: float
     activities: list[ActivityDeviation]
     raw_payload: dict = field(default_factory=dict)
-
+    investigation_type: str = "runtime" 
     enriched: bool = False
     enrichment: dict = field(default_factory=dict)
 
@@ -100,6 +101,54 @@ class InvestigationContext:
             pipeline_deviation_seconds=pb.get("deviation_seconds", 0.0),
             activities=activities,
             raw_payload=payload,
+            investigation_type="runtime" ,
+            )
+    
+    @classmethod
+    def from_cost_payload(cls, payload: dict) -> "InvestigationContext":
+        """
+        Creates an InvestigationContext for workspace-level cost investigations.
+
+        Unlike runtime investigations, cost investigations are not activity-based.
+        """
+
+        return cls(
+            subscription_id=(
+                payload.get("_subscription_id")
+                or payload.get("subscription_id")
+            ),
+
+            service=payload.get("service"),
+
+            resource_group=(
+                payload.get("resource_group")
+                or payload.get("_resource_group")
+            ),
+
+            workspace_name=(
+                payload.get("workspace_name")
+                or payload.get("factory_name")
+                or payload.get("_workspace_name")
+            ),
+
+            # Cost investigation is workspace scoped
+            item_type="workspace",
+
+            item_name=(
+                payload.get("workspace_name")
+                or payload.get("factory_name")
+                or payload.get("_workspace_name")
+            ),
+
+            # These are not used by Cost Agent
+            pipeline_health="Unknown",
+            pipeline_deviation_pct=0.0,
+            pipeline_deviation_seconds=0.0,
+
+            activities=[],
+
+            raw_payload=payload,
+            investigation_type="cost", 
         )
 
     def degraded_activities(self) -> list[ActivityDeviation]:
