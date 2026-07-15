@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from typing import Any, Optional
-
+from keyvault_client import get_secret
 from telemetry_store import TelemetryStore, TelemetryFetchError, resolve_storage_account
 from investigation_persistence import (
     BlobDocumentStore, BaseDocumentStore, PersistenceError, build_document_store,
@@ -77,9 +77,9 @@ class DashboardService:
 
 
     def list_subscriptions(self) -> list[dict]:
-        mapping_raw = os.environ.get("STORAGE_ACCOUNT_MAP")
+        mapping_raw = get_secret("STORAGE_ACCOUNT_MAP")
         if not mapping_raw:
-            single = os.environ.get("TELEMETRY_STORAGE_ACCOUNT")
+            single = get_secret("TELEMETRY_STORAGE_ACCOUNT")
             if single:
                 return [{"subscription_id": None, "storage_account": single,
                          "note": "single-account setup (TELEMETRY_STORAGE_ACCOUNT)"}]

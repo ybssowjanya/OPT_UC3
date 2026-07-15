@@ -7,7 +7,7 @@ import json
 import os
 import re
 from typing import Any, Optional
-
+from keyvault_client import get_secret
 try:
     from azure.storage.blob import BlobServiceClient, ContainerClient
     from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError, HttpResponseError
@@ -27,7 +27,7 @@ def resolve_storage_account(subscription_id: str, explicit: Optional[str] = None
     if explicit:
         return explicit
 
-    mapping_raw = os.environ.get("STORAGE_ACCOUNT_MAP")
+    mapping_raw = get_secret("STORAGE_ACCOUNT_MAP")
     if mapping_raw:
         try:
             mapping = json.loads(mapping_raw)
@@ -74,7 +74,7 @@ class TelemetryStore:
 
         account_url = f"https://{self.storage_account}.blob.core.windows.net"
         # Per-account key override: {"<storage_account>": "<key>"}
-        key_map_raw = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY_MAP")
+        key_map_raw = get_secret("AZURE_STORAGE_ACCOUNT_KEY_MAP")
         per_account_key = None
         if key_map_raw:
             try:
@@ -85,8 +85,8 @@ class TelemetryStore:
                 ) from e
 
 
-        conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        account_key = per_account_key or os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
+        conn_str = get_secret("AZURE_STORAGE_CONNECTION_STRING")
+        account_key = per_account_key or get_secret("AZURE_STORAGE_ACCOUNT_KEY")
 
         try:
             if account_key:

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from typing import Optional
+from keyvault_client import get_secret
 
 CONTAINER = "investigations"
 TRIGGER_PAYLOAD = "trigger_payload.json"
@@ -67,7 +68,7 @@ class BlobDocumentStore(BaseDocumentStore):
         account_url = f"https://{self.storage_account}.blob.core.windows.net"
 
         # Per-account key override: {"<storage_account>": "<key>"}
-        key_map_raw = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY_MAP")
+        key_map_raw = get_secret("AZURE_STORAGE_ACCOUNT_KEY_MAP")
         per_account_key = None
         if key_map_raw:
             try:
@@ -77,8 +78,8 @@ class BlobDocumentStore(BaseDocumentStore):
                     f"AZURE_STORAGE_ACCOUNT_KEY_MAP env var is set but is not valid JSON: {e}"
                 ) from e
 
-        conn_str = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        account_key = per_account_key or os.environ.get("AZURE_STORAGE_ACCOUNT_KEY")
+        conn_str = get_secret("AZURE_STORAGE_CONNECTION_STRING")
+        account_key = per_account_key or get_secret("AZURE_STORAGE_ACCOUNT_KEY")
 
         try:
             if account_key:

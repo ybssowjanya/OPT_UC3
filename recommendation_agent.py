@@ -8,7 +8,7 @@ import json
 import os
 from schemas import InvestigationContext, RootCause, Recommendation
 from sub_agents.base_agent import BaseIntelligenceAgent
-
+from keyvault_client import get_secret
 try:
     from claude_agent_sdk import ClaudeAgentOptions, query as sdk_query
     SDK_AVAILABLE = True
@@ -56,7 +56,7 @@ class RecommendationAgent:
         self._last_call_meta = {}
         if anthropic_ready():
             self._last_provider = "anthropic"
-            client = anthropic.AsyncAnthropic()
+            client = anthropic.AsyncAnthropic(api_key=get_secret("ANTHROPIC_API_KEY", required=True))
             response = await client.messages.create(
                 model=self.model, max_tokens=2000,
                 system=self.system_prompt,
