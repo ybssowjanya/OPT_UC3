@@ -5,7 +5,7 @@ from typing import Callable, Optional
 
 from datetime import datetime, timezone
 from time import perf_counter
-
+from keyvault_client import get_secret
 from schemas import InvestigationContext, AgentFinding
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
@@ -27,7 +27,7 @@ except ImportError:
 
 def anthropic_ready() -> bool:
     
-    return _ANTHROPIC_IMPORTED and bool(os.environ.get("ANTHROPIC_API_KEY"))
+    return _ANTHROPIC_IMPORTED and bool(get_secret("ANTHROPIC_API_KEY"))
 
 try:
     # pip install google-genai
@@ -248,7 +248,7 @@ class BaseIntelligenceAgent:
         try:
             if LLM_PROVIDER == "gemini":
                 provider = "gemini"
-                if not GEMINI_AVAILABLE or not os.environ.get("GEMINI_API_KEY"):
+                if not GEMINI_AVAILABLE or not get_secret("GEMINI_API_KEY"):
                     raise RuntimeError(
                         f"{self.role_name}: LLM_PROVIDER=gemini but google-genai is not "
                         "installed or GEMINI_API_KEY is not set."
@@ -305,7 +305,7 @@ class BaseIntelligenceAgent:
 
     async def _call_anthropic(self, prompt: str) -> str:
         
-        client = anthropic.AsyncAnthropic()  
+        client = anthropic.AsyncAnthropic(api_key=get_secret("ANTHROPIC_API_KEY", required=True))  
         response = await client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
@@ -322,7 +322,7 @@ class BaseIntelligenceAgent:
 
     async def _call_gemini(self, prompt: str) -> str:
         
-        client = gemini_client_lib.Client(api_key=os.environ["GEMINI_API_KEY"])
+        client = gemini_client_lib.Client(api_key=get_secret("GEMINI_API_KEY", required=True))
         gemini_model = GEMINI_MODEL_MAP.get(self.model, "gemini-2.5-flash")
         full_prompt = f"{self.system_prompt}\n\n{prompt}"
         response = client.models.generate_content(model=gemini_model, contents=full_prompt)

@@ -12,6 +12,15 @@ from telemetry_store import TelemetryFetchError, RESOLVER_VERSION
 from investigation_persistence import PersistenceError
 from planner_agent import PlannerAgent
 
+STEP_LABELS = {
+    "enrichment_seconds": "Gathering pipeline telemetry data",
+    "intelligence_agents_seconds": "Analyzing pipeline execution",
+    "evidence_validation_seconds": "Validating findings",
+    "root_cause_seconds": "Identifying root causes",
+    "recommendation_seconds": "Generating recommendations",
+    "impact_seconds": "Assessing impacted assets",
+    "report_seconds": "Compiling investigation report",
+}
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -171,11 +180,14 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
         return {"investigation_id": investigation_id, "status": "failed",
                 "error": manifest.get("error"), "manifest": manifest}
 
+    stage_timings = manifest.get("stage_timings") or {}
+    last_stage_key = list(stage_timings)[-1] if stage_timings else None
+    current_step = STEP_LABELS.get(last_stage_key, last_stage_key) or "Starting"
+
     return {
         "investigation_id": investigation_id,
         "status": "running",
-        "current_step": (manifest.get("stage_timings") or {}) and
-                        sorted(manifest["stage_timings"])[-1] or "starting",
+        "current_step": current_step,
         "elapsed_seconds": manifest.get("total_seconds_so_far"),
         "dispatched_agents": manifest.get("dispatched_agents", []),
         "agent_runs": manifest.get("agent_runs"),

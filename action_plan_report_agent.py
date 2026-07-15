@@ -12,7 +12,7 @@ import re
 from datetime import datetime, timezone
 from typing import Optional, Callable
 from schemas import InvestigationState
-
+from keyvault_client import get_secret
 import azure_openai_client
 from sub_agents.base_agent import anthropic_ready
 
@@ -175,7 +175,7 @@ class ActionPlanReportAgent:
 
     async def _call_code_patch_model(self, prompt: str) -> str:
         if anthropic_ready():
-            client = anthropic.AsyncAnthropic()
+            client = anthropic.AsyncAnthropic(api_key=get_secret("ANTHROPIC_API_KEY", required=True))
             response = await client.messages.create(
                 model=CODE_PATCH_MODEL,
                 max_tokens=8000,

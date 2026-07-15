@@ -17,7 +17,7 @@ except ImportError:
     SDK_AVAILABLE = False
 
 from sub_agents.base_agent import anthropic_ready
-
+from keyvault_client import get_secret
 try:
     import anthropic
 except ImportError:
@@ -105,7 +105,7 @@ class RootCauseAgent:
         self._last_call_meta = {}
         if anthropic_ready():
             self._last_provider = "anthropic"
-            client = anthropic.AsyncAnthropic()
+            client = anthropic.AsyncAnthropic(api_key=get_secret("ANTHROPIC_API_KEY", required=True))
             response = await client.messages.create(
                 model=self.model, max_tokens=2000,
                 system=self.system_prompt,

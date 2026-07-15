@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from typing import Optional
+from keyvault_client import get_secret
 
 try:
     from openai import AsyncAzureOpenAI
@@ -18,7 +19,7 @@ REQUIRED_ENV_VARS = (
 
 
 def azure_gpt5_available() -> bool:
-    return _OPENAI_IMPORTED and all(os.environ.get(v) for v in REQUIRED_ENV_VARS)
+    return _OPENAI_IMPORTED and all(get_secret(v) for v in REQUIRED_ENV_VARS)
 
 
 def _get_client() -> "AsyncAzureOpenAI":
@@ -29,9 +30,9 @@ def _get_client() -> "AsyncAzureOpenAI":
                 "openai package is not installed. Install with: pip install openai"
             )
         _client = AsyncAzureOpenAI(
-            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-            api_key=os.environ["AZURE_OPENAI_API_KEY"],
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+             azure_endpoint=get_secret("AZURE_OPENAI_ENDPOINT", required=True),
+            api_key=get_secret("AZURE_OPENAI_API_KEY", required=True),
+            api_version=get_secret("AZURE_OPENAI_API_VERSION", default="2024-10-21"),
         )
     return _client
 
@@ -41,7 +42,7 @@ last_call_meta: dict = {}
 async def azure_gpt5_caller(system_prompt: str, user_prompt: str) -> str:
     global last_call_meta
     client = _get_client()
-    deployment = os.environ["AZURE_OPENAI_GPT5_DEPLOYMENT"]  # deployment name, not the model name
+    deployment = get_secret("AZURE_OPENAI_GPT5_DEPLOYMENT", required=True)  # deployment name, not the model name
     response = await client.chat.completions.create(
         model=deployment,
         messages=[
