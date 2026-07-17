@@ -306,12 +306,12 @@ class DashboardService:
             store, subscription_id, service, resource_group, workspace,
             item_type, item_name)
         # the pipeline needs the subscription for storage resolution
-        payload.setdefault("subscription_id", subscription_id)
-        payload.setdefault("service", service)
-        payload.setdefault("resource_group", resource_group)
-        payload.setdefault("workspace_name", workspace)
-        payload.setdefault("item_type", item_type)
-        payload.setdefault("item_name", item_name)
+        payload["subscription_id"] = subscription_id
+        payload["service"] = service
+        payload["resource_group"] = resource_group
+        payload["workspace_name"] = workspace
+        payload["item_type"] = item_type
+        payload["item_name"] = item_name
         return payload
 
     async def investigation_status(self, subscription_id: str, service: str,

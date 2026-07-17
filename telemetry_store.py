@@ -161,6 +161,11 @@ class TelemetryStore:
 
 
     def _resolve_item_sync(self, base_dir: str, item_name: str) -> dict:
+        if not isinstance(item_name, str):
+            raise TelemetryFetchError(
+                f"item_name must be a string, got {type(item_name).__name__}: {item_name!r} "
+                f"(base_dir={base_dir})"
+            )
         candidates = {item_name, item_name.replace(" ", "_"), item_name.replace("_", " ")}
         listing = self._list_sync(f"{base_dir}/")
         names = [b.name for b in listing]

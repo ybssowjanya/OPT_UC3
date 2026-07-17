@@ -139,6 +139,8 @@ def _resolve_notebook_reference(service: str, item_definition: dict,
         if act_def.get("name") == activity.activity_name:
             nb = act_def.get("notebook") or {}
             ref = nb.get("reference_name") or nb.get("referenceName")
+            if isinstance(ref, dict):
+                ref = ref.get("value")
             if ref:
                 return ref
             raise TelemetryFetchError(
