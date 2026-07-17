@@ -12,6 +12,8 @@ from investigation_persistence import (
     FINDINGS, VALIDATED_FINDINGS, ROOT_CAUSES, RECOMMENDATIONS,
     IMPACT, FINAL_REPORT, CHECKPOINTS,
 )
+from datetime import datetime
+import calendar
 
 # telemetry-container dirs that are NOT services
 NON_SERVICE_DIRS = {"item_runs", "baseline", "activity_baseline", "investigations"}
@@ -168,6 +170,58 @@ class DashboardService:
                 rows.append(await self._item_row(
                     store, subscription_id, service, resource_group, workspace, t, name))
         return rows
+    
+    async def _load_cost_consumption(
+        self,
+        store: TelemetryStore,
+        service: str,
+        resource_group: str,
+        workspace: str,
+    ) -> dict | None:
+        """
+        Load workspace-level cost_consumption.json.
+        Returns None if the blob doesn't exist.
+        """
+
+        path = (
+            f"{service}/"
+            f"{resource_group}/"
+            f"{workspace}/"
+            "cost_consumption.json"
+        )
+
+        try:
+            return await store.get_json(path)
+        except TelemetryFetchError:
+            return None
+        
+    def _estimate_monthly_cost(self, cost: dict) -> float | None:
+        if not cost:
+            return None
+
+        total_cost = cost.get("total_cost")
+        fetched_at = cost.get("fetched_at")
+
+        if total_cost is None:
+            return None
+
+        if fetched_at:
+            dt = datetime.fromisoformat(
+                fetched_at.replace("Z", "+00:00")
+            )
+        else:
+            dt = datetime.utcnow()
+
+        days_elapsed = max(dt.day, 1)
+        days_in_month = calendar.monthrange(
+            dt.year,
+            dt.month,
+        )[1]
+
+        return round(
+            (total_cost / days_elapsed) * days_in_month,
+            2,
+        )
 
     async def _item_row(self, store: TelemetryStore, subscription_id: str,
                         service: str, resource_group: str, workspace: str,
@@ -183,12 +237,28 @@ class DashboardService:
             "health_state": None,
             "activities_count": None,
             "calculated_at": None,
+            
+            "current_month_cost": None,
+            "baseline_monthly_cost": None,
             "estimated_monthly_cost": None,
+            "currency": None,
         }
         try:
             baseline = await self._latest_deviation_output(
                 store, subscription_id, service, resource_group, workspace,
                 item_type, item_name)
+            cost = await self._load_cost_consumption(
+                store,
+                service,
+                resource_group,
+                workspace,
+            )
+
+            if cost:
+                row["current_month_cost"] = cost.get("total_cost")
+                row["baseline_monthly_cost"] = cost.get("baseline_monthly_cost")
+                row["estimated_monthly_cost"] = self._estimate_monthly_cost(cost)
+                row["currency"] = cost.get("currency")
         except TelemetryFetchError as e:
             baseline = None
             row["baseline_error"] = str(e)
@@ -330,6 +400,15 @@ class DashboardService:
                 return default
 
         manifest = await inv.get(service, investigation_id, MANIFEST)  # required
+        # Load workspace cost information
+        store = self.telemetry(subscription_id)
+
+        cost = await self._load_cost_consumption(
+            store,
+            service,
+            manifest.get("resource_group"),
+            manifest.get("workspace_name"),
+        )
         trigger = await load(TRIGGER_PAYLOAD, {})
         enrichment = await load(ENRICHMENT, {})
         agents_meta = await load(AGENTS_METADATA, [])
@@ -341,6 +420,17 @@ class DashboardService:
         checkpoints = await load(CHECKPOINTS, [])
 
         notebooks = (enrichment or {}).get("notebooks", {}) or {}
+
+        estimated_monthly_cost = None
+        current_month_cost = None
+        baseline_monthly_cost = None
+        currency = None
+
+        if cost:
+            current_month_cost = cost.get("total_cost")
+            baseline_monthly_cost = cost.get("baseline_monthly_cost")
+            estimated_monthly_cost = self._estimate_monthly_cost(cost)
+            currency = cost.get("currency")
 
         # -- header ------------------------------------------------------
         header = {
@@ -368,8 +458,11 @@ class DashboardService:
             "stage_timings": manifest.get("stage_timings"),
             "total_input_tokens": manifest.get("total_input_tokens"),
             "total_output_tokens": manifest.get("total_output_tokens"),
-            # cost not stored yet
-            "estimated_monthly_cost": None,
+
+            "current_month_cost": current_month_cost,
+            "baseline_monthly_cost": baseline_monthly_cost,
+            "estimated_monthly_cost": estimated_monthly_cost,
+            "currency": currency,
         }
 
         # -- "analysis pipeline telemetry" ----------------------
