@@ -161,9 +161,7 @@ class PlannerAgent:
 
     def select_agents_to_dispatch(self, ctx: InvestigationContext) -> set[AgentRole]:
         selected: set[AgentRole] = set()
-        if ctx.pipeline_health == "Healthy":
-            return selected
-        
+
         # Cost investigation
         payload = ctx.raw_payload
 
@@ -175,14 +173,21 @@ class PlannerAgent:
 
         degraded = ctx.degraded_activities()
 
+        # If the pipeline-level health is Healthy AND no individual activities
+        # are in Warning/Severe, there is genuinely nothing to investigate.
+        if ctx.pipeline_health == "Healthy" and not degraded:
+            return selected  # empty → triggers the skip path in run_investigation
+
         for activity in degraded:
             agents = ACTIVITY_TYPE_TO_AGENTS.get(
                 activity.activity_type, DEFAULT_AGENTS_FOR_UNKNOWN_TYPE
             )
             selected.update(agents)
 
+        # Pipeline-level health is Warning/Severe but no individual activities
+        # were flagged (can happen with aggregate-only deviation signals) →
+        # fall back to a broad runtime sweep.
         if not selected:
-    
             selected.add(AgentRole.RUNTIME_INTELLIGENCE)
 
         if len(selected) > 1:
@@ -404,7 +409,7 @@ class PlannerAgent:
             pending_agents = self.select_agents_to_dispatch(ctx)
 
             if not pending_agents:
-                # Pipeline is Healthy
+                # Pipeline health is Healthy AND no activities are in Warning/Severe state
                 stage_timings["intelligence_agents_seconds"] = 0.0
                 message = (
                     f"'{ctx.item_name}' ({ctx.service}/{ctx.item_type}) is Healthy "
