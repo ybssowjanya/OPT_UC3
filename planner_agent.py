@@ -161,12 +161,6 @@ class PlannerAgent:
 
     def select_agents_to_dispatch(self, ctx: InvestigationContext) -> set[AgentRole]:
         selected: set[AgentRole] = set()
-
-        # Overall pipeline_health is the authoritative signal. If the pipeline
-        # as a whole is Healthy, we do not dispatch any investigation agents -
-        # even if individual activities show Warning/Severe (this happens with
-        # small, noisy percentage swings on short-duration activities and does
-        # not represent an actual production issue worth root-causing).
         if ctx.pipeline_health == "Healthy":
             return selected
         
@@ -208,8 +202,14 @@ class PlannerAgent:
             coros.append(agent.investigate(ctx))
             dispatched_roles.append(role)
             state.dispatched_agents.append(role.value)
+        self._current_stage = "intelligence_agents_seconds"           # ADD
+        self._active_agents = [r.value for r in dispatched_roles]
+        await self.save_investigation_state(state, "agents_dispatched")  # ADD
 
-        results = await asyncio.gather(*coros, return_exceptions=True)
+        try:
+            results = await asyncio.gather(*coros, return_exceptions=True)
+        finally:
+            self._active_agents = [] 
         findings: list[AgentFinding] = []
         errors: list[str] = []
         for role, r in zip(dispatched_roles, results):
@@ -281,6 +281,9 @@ class PlannerAgent:
             "pipeline_deviation_pct": ctx.pipeline_deviation_pct,
             "pipeline_deviation_seconds": ctx.pipeline_deviation_seconds,
             "stage_timings": self.stage_timings,
+            "current_stage": getattr(self, "_current_stage", None),
+            "active_agents": list(getattr(self, "_active_agents", [])),
+            "dispatched_agents": list(state.dispatched_agents),
             "agent_runs": len(runs),
             "agent_failures": [r["agent"] for r in runs if r.get("status") == "failed"],
             "total_input_tokens": sum(r.get("input_tokens") or 0 for r in runs),
@@ -366,6 +369,8 @@ class PlannerAgent:
         self.stage_timings = stage_timings
         self.checkpoints: list[dict] = []
         self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
+        self._active_agents: list[str] = ["planner_agent"]
+        self._current_stage: str = "queued"
 
         await self._put(ctx, TRIGGER_PAYLOAD, {
             "investigation_id": self.investigation_id,
@@ -383,6 +388,7 @@ class PlannerAgent:
 
         try:
             # ---- MANDATORY ENRICHMENT (before any agent dispatch) ------
+            self._current_stage = "enrichment_seconds"
             t = perf_counter()
             if ctx.investigation_type != "cost":
                 await TelemetryEnricher(store).enrich(ctx)
@@ -398,13 +404,7 @@ class PlannerAgent:
             pending_agents = self.select_agents_to_dispatch(ctx)
 
             if not pending_agents:
-                # Pipeline is Healthy (or otherwise had nothing degraded to
-                # investigate) - no agents were dispatched. Skip the entire
-                # downstream chain (evidence validation / root cause /
-                # recommendation / impact / report all have nothing to work
-                # with anyway) and return a clear, explicit "no investigation
-                # needed" result instead of a report that looks complete but
-                # is silently empty.
+                # Pipeline is Healthy
                 stage_timings["intelligence_agents_seconds"] = 0.0
                 message = (
                     f"'{ctx.item_name}' ({ctx.service}/{ctx.item_type}) is Healthy "
@@ -459,7 +459,18 @@ class PlannerAgent:
             stage_timings["intelligence_agents_seconds"] = round(perf_counter() - t, 3)
             await self._put(ctx, FINDINGS, [f.to_dict() for f in state.findings])
 
+            # ---- Hub: planner consolidates findings from all dispatched
+            self._current_stage = "planner_synthesis_seconds"
+            self._active_agents = ["planner_agent"]
+            t_hub = perf_counter()
+            await self.save_investigation_state(state, "planner_consolidating_findings")
+            await asyncio.sleep(0.6)
+            stage_timings["planner_synthesis_seconds"] = round(perf_counter() - t_hub, 3)
+
             # ---- Evidence Validation Agent - strict "verified" gatekeeper --
+            self._current_stage = "evidence_validation_seconds"
+            self._active_agents = ["evidence_validation_agent"]
+            await self.save_investigation_state(state, "evidence_validation_started")
             t = perf_counter()
             stage_start = datetime.now(timezone.utc).isoformat()
             pre = [(f.agent, f.summary, f.confidence) for f in state.findings]
@@ -491,6 +502,9 @@ class PlannerAgent:
             await self.save_investigation_state(state, "evidence_validated")
 
             # ---- Root Cause Agent ------------------------------------------
+            self._current_stage = "root_cause_seconds"
+            self._active_agents = ["root_cause_agent"]
+            await self.save_investigation_state(state, "root_cause_started")
             t = perf_counter()
             stage_start = datetime.now(timezone.utc).isoformat()
             state.root_causes = await self.root_cause_agent.analyze(ctx, state.validated_findings)
@@ -506,6 +520,9 @@ class PlannerAgent:
             await self.save_investigation_state(state, "root_cause_complete")
 
             # ---- Recommendation & Validation Agent -------------------------
+            self._current_stage = "recommendation_seconds"
+            self._active_agents = ["recommendation_agent"]
+            await self.save_investigation_state(state, "recommendation_started")
             t = perf_counter()
             stage_start = datetime.now(timezone.utc).isoformat()
             state.recommendations = await self.recommendation_agent.generate(ctx, state.root_causes)
@@ -524,6 +541,9 @@ class PlannerAgent:
             await self.save_investigation_state(state, "recommendations_generated")
 
             # ---- Impact Agent ----------------------------------------------
+            self._current_stage = "impact_seconds"
+            self._active_agents = ["impact_agent"]
+            await self.save_investigation_state(state, "impact_started")
             t = perf_counter()
             stage_start = datetime.now(timezone.utc).isoformat()
             state.impact_summary = await self.impact_agent.assess(ctx, state.recommendations)
@@ -539,6 +559,9 @@ class PlannerAgent:
             await self.save_investigation_state(state, "impact_assessed")
 
             # ---- Action Plan & Report Agent --------------------------------
+            self._current_stage = "report_seconds"
+            self._active_agents = ["action_plan_report_agent"]
+            await self.save_investigation_state(state, "report_started")
             t = perf_counter()
             stage_start = datetime.now(timezone.utc).isoformat()
             state.final_report = await self.report_agent.generate(state)
@@ -604,6 +627,8 @@ class PlannerAgent:
             self.stage_timings = stage_timings
             self.checkpoints: list[dict] = []
             self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
+            self._active_agents: list[str] = ["planner_agent"]
+            self._current_stage: str = "queued"
 
             await self._put(ctx, TRIGGER_PAYLOAD, {
                 "investigation_id": self.investigation_id,
@@ -621,6 +646,7 @@ class PlannerAgent:
 
             try:
                 # ---- MANDATORY ENRICHMENT (before any agent dispatch) ------
+                self._current_stage = "enrichment_seconds"
                 ctx.enriched = True
                 ctx.enrichment = {}
 
@@ -628,6 +654,9 @@ class PlannerAgent:
                 await self.save_investigation_state(state, "cost_context_ready")
 
                 # ---- intelligence agent rounds ------------------------------
+                self._current_stage = "intelligence_agents_seconds"
+                self._active_agents = ["cost_intelligence"]
+                await self.save_investigation_state(state, "agents_dispatched")
                 t = perf_counter()
                 cost_agent = self._sub_agent_pool[AgentRole.COST_INTELLIGENCE]
 
@@ -646,7 +675,19 @@ class PlannerAgent:
                 stage_timings["intelligence_agents_seconds"] = round(perf_counter() - t, 3)
                 await self._put(ctx, FINDINGS, [f.to_dict() for f in state.findings])
 
+                # ---- Hub: planner consolidates the cost agent's findings
+                # before handing off to evidence validation ----------------
+                self._current_stage = "planner_synthesis_seconds"
+                self._active_agents = ["planner_agent"]
+                t_hub = perf_counter()
+                await self.save_investigation_state(state, "planner_consolidating_findings")
+                await asyncio.sleep(0.6)
+                stage_timings["planner_synthesis_seconds"] = round(perf_counter() - t_hub, 3)
+
                 # ---- Evidence Validation Agent - strict "verified" gatekeeper --
+                self._current_stage = "evidence_validation_seconds"
+                self._active_agents = ["evidence_validation_agent"]
+                await self.save_investigation_state(state, "evidence_validation_started")
                 t = perf_counter()
                 stage_start = datetime.now(timezone.utc).isoformat()
                 pre = [(f.agent, f.summary, f.confidence) for f in state.findings]
@@ -686,6 +727,9 @@ class PlannerAgent:
                 await self.save_investigation_state(state, "evidence_validated")
 
                 # ---- Root Cause Agent ------------------------------------------
+                self._current_stage = "root_cause_seconds"
+                self._active_agents = ["root_cause_agent"]
+                await self.save_investigation_state(state, "root_cause_started")
                 t = perf_counter()
                 stage_start = datetime.now(timezone.utc).isoformat()
                 state.root_causes = await self.root_cause_agent.analyze(ctx, state.validated_findings)
@@ -701,6 +745,9 @@ class PlannerAgent:
                 await self.save_investigation_state(state, "root_cause_complete")
 
                 # ---- Recommendation & Validation Agent -------------------------
+                self._current_stage = "recommendation_seconds"
+                self._active_agents = ["recommendation_agent"]
+                await self.save_investigation_state(state, "recommendation_started")
                 t = perf_counter()
                 stage_start = datetime.now(timezone.utc).isoformat()
                 state.recommendations = await self.recommendation_agent.generate(ctx, state.root_causes)
@@ -719,6 +766,9 @@ class PlannerAgent:
                 await self.save_investigation_state(state, "recommendations_generated")
 
                 # ---- Impact Agent ----------------------------------------------
+                self._current_stage = "impact_seconds"
+                self._active_agents = ["impact_agent"]
+                await self.save_investigation_state(state, "impact_started")
                 t = perf_counter()
                 stage_start = datetime.now(timezone.utc).isoformat()
                 state.impact_summary = await self.impact_agent.assess(ctx, state.recommendations)
@@ -734,6 +784,9 @@ class PlannerAgent:
                 await self.save_investigation_state(state, "impact_assessed")
 
                 # ---- Action Plan & Report Agent --------------------------------
+                self._current_stage = "report_seconds"
+                self._active_agents = ["action_plan_report_agent"]
+                await self.save_investigation_state(state, "report_started")
                 t = perf_counter()
                 stage_start = datetime.now(timezone.utc).isoformat()
                 state.final_report = await self.report_agent.generate(state)

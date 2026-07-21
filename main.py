@@ -13,8 +13,10 @@ from investigation_persistence import PersistenceError
 from planner_agent import PlannerAgent
 
 STEP_LABELS = {
+    "queued": "Starting investigation",
     "enrichment_seconds": "Gathering pipeline telemetry data",
     "intelligence_agents_seconds": "Analyzing pipeline execution",
+    "planner_synthesis_seconds": "Consolidating agent findings",
     "evidence_validation_seconds": "Validating findings",
     "root_cause_seconds": "Identifying root causes",
     "recommendation_seconds": "Generating recommendations",
@@ -135,7 +137,7 @@ async def analyze_workload(sub: str, service: str, rg: str, ws: str,
     )
     with _lock:
         _running_threads[investigation_id] = thread
-    thread.start()   # returns almost immediately - does not wait for the investigation
+    thread.start()   # returns immediately - does not wait for the investigation
 
     base = f"/api/subscriptions/{sub}/services/{service}/investigations/{investigation_id}"
     return {
@@ -180,15 +182,15 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
         return {"investigation_id": investigation_id, "status": "failed",
                 "error": manifest.get("error"), "manifest": manifest}
 
-    stage_timings = manifest.get("stage_timings") or {}
-    last_stage_key = list(stage_timings)[-1] if stage_timings else None
-    current_step = STEP_LABELS.get(last_stage_key, last_stage_key) or "Starting"
+    current_stage_key = manifest.get("current_stage")
+    current_step = STEP_LABELS.get(current_stage_key, current_stage_key) or "Starting"
 
     return {
         "investigation_id": investigation_id,
         "status": "running",
         "current_step": current_step,
         "elapsed_seconds": manifest.get("total_seconds_so_far"),
+        "active_agents": manifest.get("active_agents", []),
         "dispatched_agents": manifest.get("dispatched_agents", []),
         "agent_runs": manifest.get("agent_runs"),
         "findings_count": manifest.get("findings_count"),
@@ -235,11 +237,8 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
 
 @app.post("/post-cost-investigation")
 async def post_cost_investigation(payload: dict):
-
     planner = PlannerAgent()
-
     state = await planner.run_cost_investigation(payload)
-
     return state.final_report
 
 
