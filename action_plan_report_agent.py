@@ -15,7 +15,7 @@ from schemas import InvestigationState
 from keyvault_client import get_secret
 import azure_openai_client
 from sub_agents.base_agent import anthropic_ready
-
+from calendar import monthrange
 try:
     from claude_agent_sdk import ClaudeAgentOptions, query as sdk_query
     SDK_AVAILABLE = True
@@ -293,6 +293,48 @@ class ActionPlanReportAgent:
                 self._last_provider = "deterministic_fallback"
                 self._last_call_meta = {"error": f"{type(e).__name__}: {e}"}
         return narrative
+    
+    def build_cost_summary(self, state: InvestigationState) -> dict | None:
+        cost_agent_ran = any(
+            f.agent == "cost_intelligence_agent"
+            for f in state.validated_findings
+        )
+        if not cost_agent_ran:
+            return None
+
+        payload = state.context.raw_payload or {}
+        current_cost = float(payload.get("total_cost", 0))
+        baseline = float(payload.get("baseline_monthly_cost", 0))
+        currency = payload.get("currency", "INR")
+
+        today = datetime.now(timezone.utc)
+        days_elapsed = max(today.day, 1)
+        days_in_month = monthrange(today.year, today.month)[1]
+
+        estimated_monthly_cost = round(
+            (current_cost / days_elapsed) * days_in_month, 2
+        )
+        forecast_deviation = round(estimated_monthly_cost - baseline, 2)
+        forecast_deviation_pct = (
+            round((forecast_deviation / baseline) * 100, 2) if baseline else 0
+        )
+
+        if forecast_deviation > 0:
+            status = "above_baseline"
+        elif forecast_deviation < 0:
+            status = "below_baseline"
+        else:
+            status = "within_baseline"
+
+        return {
+            "currency": currency,
+            "current_month_cost": round(current_cost, 2),
+            "baseline_monthly_cost": round(baseline, 2),
+            "estimated_monthly_cost": estimated_monthly_cost,
+            "forecast_deviation": forecast_deviation,
+            "forecast_deviation_pct": forecast_deviation_pct,
+            "forecast_status": status,
+        }
 
     async def generate(self, state: InvestigationState) -> dict:
         narrative = await self.generate_final_report(state)
@@ -302,8 +344,8 @@ class ActionPlanReportAgent:
         compilation_adjustment = self.generate_compilation_adjustment(code_patches)
         ctx = state.context
         apply_fix_payloads = [self.prepare_apply_fix_payload(f, ctx) for f in fixes]
-
-        return {
+        cost_summary = self.build_cost_summary(state)
+        report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "subscription_id": ctx.subscription_id,
             "service": ctx.service,
@@ -323,3 +365,7 @@ class ActionPlanReportAgent:
             "apply_fix_payloads": apply_fix_payloads,
             "code_patches": code_patches,
         }
+        if cost_summary is not None:
+            report.update(cost_summary)
+
+        return report
