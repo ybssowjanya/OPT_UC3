@@ -239,33 +239,7 @@ async def investigation_poll(sub: str, service: str, investigation_id: str):
 async def post_cost_investigation(payload: dict):
     planner = PlannerAgent()
     state = await planner.run_cost_investigation(payload)
-
-    report = state.final_report.copy()
-    try:
-        cost = await svc._load_cost_consumption(
-            svc.telemetry(state.context.subscription_id),
-            state.context.service,
-            state.context.resource_group,
-            state.context.workspace_name,
-        )
-        if cost:
-            report["current_month_cost"] = cost.get("total_cost")
-            report["baseline_monthly_cost"] = cost.get("baseline_monthly_cost")
-            report["estimated_monthly_cost"] = svc._estimate_monthly_cost(cost)
-            report["currency"] = cost.get("currency")
-        else:
-            report.setdefault("current_month_cost", None)
-            report.setdefault("baseline_monthly_cost", None)
-            report.setdefault("estimated_monthly_cost", None)
-            report.setdefault("currency", None)
-    except Exception:
-        # Cost enrichment is best-effort; never block the response
-        report.setdefault("current_month_cost", None)
-        report.setdefault("baseline_monthly_cost", None)
-        report.setdefault("estimated_monthly_cost", None)
-        report.setdefault("currency", None)
-
-    return report
+    return state.final_report
 
 
 @app.get("/api/health")
