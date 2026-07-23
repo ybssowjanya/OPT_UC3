@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +9,7 @@ from keyvault_client import get_secret
 try:
     from azure.storage.blob import BlobServiceClient, ContainerClient
     from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError, HttpResponseError
-except ImportError as _e:  # pragma: no cover
+except ImportError as _e: 
     raise ImportError(
         "azure-storage-blob is required for telemetry enrichment. "
         "Install with: pip install azure-storage-blob azure-identity"
@@ -169,6 +167,9 @@ class TelemetryStore:
         candidates = {item_name, item_name.replace(" ", "_"), item_name.replace("_", " ")}
         listing = self._list_sync(f"{base_dir}/")
         names = [b.name for b in listing]
+        blob_modified: dict[str, object] = {
+            b.name: b.last_modified for b in listing
+        }
 
         # exact / variant file match
         for cand in candidates:
@@ -212,12 +213,30 @@ class TelemetryStore:
                 return {"kind": "folder", "paths": sorted(inside)}
             return {"kind": "file", "path": f"{base_dir}/{head}"}
         if len(prefixed_hits) > 1:
-            raise TelemetryFetchError(
-                f"Item '{item_name}' is AMBIGUOUS under {self.container_name}/{base_dir}/ "
-                f"in storage account '{self.storage_account}': multiple order-prefixed "
-                f"candidates match: {sorted(prefixed_hits)}. Rename to disambiguate or "
-                "store a notebook with the exact task name."
+            def _latest_modified(h: str) -> object:
+                rel = prefixed_hits[h]
+                blob_path = f"{base_dir}/{h}" if "/" not in rel else f"{base_dir}/{h}/"
+                # find the newest last_modified among all blobs under this head
+                ts = max(
+                    (blob_modified.get(n) for n in names if n.startswith(f"{base_dir}/{h}")),
+                    default=None,
+                )
+                return ts
+
+            best_head = max(prefixed_hits, key=_latest_modified)
+            best_rel = prefixed_hits[best_head]
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "TelemetryStore: item %r is ambiguous under %s/%s/ — "
+                "candidates %s — picking most recently modified candidate %r.",
+                item_name, self.container_name, base_dir,
+                sorted(prefixed_hits), best_head,
             )
+            if "/" in best_rel:
+                folder_prefix = f"{base_dir}/{best_head}/"
+                inside = [n for n in names if n.startswith(folder_prefix) and n.endswith(".json")]
+                return {"kind": "folder", "paths": sorted(inside)}
+            return {"kind": "file", "path": f"{base_dir}/{best_head}"}
 
         available = sorted({n[len(base_dir) + 1:].split("/", 1)[0] for n in names})
         raise TelemetryFetchError(
