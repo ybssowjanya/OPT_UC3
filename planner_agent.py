@@ -269,6 +269,7 @@ class PlannerAgent:
         runs = ctx.agent_run_log
         return {
             "investigation_id": self.investigation_id,
+            "investigation_type": getattr(self, "_investigation_type", "runtime"),
             "status": self._status,
             "error": self._error,
             "skipped_reason": self._skipped_reason,
@@ -376,6 +377,7 @@ class PlannerAgent:
         self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
         self._active_agents: list[str] = ["planner_agent"]
         self._current_stage: str = "queued"
+        self._investigation_type = "runtime"
 
         await self._put(ctx, TRIGGER_PAYLOAD, {
             "investigation_id": self.investigation_id,
@@ -634,6 +636,7 @@ class PlannerAgent:
             self.planner_doc: dict = {"rounds": [], "followup_rounds": []}
             self._active_agents: list[str] = ["planner_agent"]
             self._current_stage: str = "queued"
+            self._investigation_type = "cost"
 
             await self._put(ctx, TRIGGER_PAYLOAD, {
                 "investigation_id": self.investigation_id,
