@@ -1,6 +1,6 @@
 from __future__ import annotations
-
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -237,6 +237,35 @@ class TelemetryStore:
                 inside = [n for n in names if n.startswith(folder_prefix) and n.endswith(".json")]
                 return {"kind": "folder", "paths": sorted(inside)}
             return {"kind": "file", "path": f"{base_dir}/{best_head}"}
+
+        stems: dict[str, str] = {}   # normalized_stem -> head (first path segment)
+        for n in names:
+            rel = n[len(base_dir) + 1:]
+            head = rel.split("/", 1)[0]
+            stem = head[:-5] if head.endswith(".json") else head
+            stems.setdefault(_normalize(stem), head)
+
+        close = difflib.get_close_matches(want, stems.keys(), n=2, cutoff=0.72)
+        if len(close) == 1 or (len(close) > 1 and close[0] != close[1]
+                                and difflib.SequenceMatcher(None, want, close[0]).ratio()
+                                - difflib.SequenceMatcher(None, want, close[1]).ratio() > 0.08):
+            head = stems[close[0]]
+            is_folder = any(
+                n[len(base_dir) + 1:].split("/", 1)[0] == head and "/" in n[len(base_dir) + 1:]
+                for n in names
+            )
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "TelemetryStore: item %r not found exactly under %s/%s/ - "
+                "using closest fuzzy match %r instead. This may be a rename "
+                "or typo between the baseline data and the notebook asset name.",
+                item_name, self.container_name, base_dir, head,
+            )
+            if is_folder:
+                folder_prefix = f"{base_dir}/{head}/"
+                inside = [n for n in names if n.startswith(folder_prefix) and n.endswith(".json")]
+                return {"kind": "folder", "paths": sorted(inside)}
+            return {"kind": "file", "path": f"{base_dir}/{head}"}
 
         available = sorted({n[len(base_dir) + 1:].split("/", 1)[0] for n in names})
         raise TelemetryFetchError(
