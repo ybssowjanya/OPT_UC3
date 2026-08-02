@@ -242,6 +242,66 @@ async def post_cost_investigation(payload: dict):
     return state.final_report
 
 
+@app.get("/api/subscriptions/{sub}/investigations/runtime")
+async def runtime_investigations(sub: str):
+    try:
+        return await svc.list_runtime_investigations(sub)
+    except Exception as e:
+        raise _http(e)
+
+
+@app.get("/api/subscriptions/{sub}/investigations/cost")
+async def cost_investigations(sub: str):
+    try:
+        return await svc.list_cost_investigations(sub)
+    except Exception as e:
+        raise _http(e)
+
+
+@app.get("/api/subscriptions/{sub}/services/{service}/cost-investigations/{investigation_id}")
+async def cost_investigation_detail(sub: str, service: str, investigation_id: str):
+    try:
+        manifest = await svc.investigation_status(sub, service, investigation_id)
+    except PersistenceError as e:
+        raise _http(e)
+    except Exception as e:
+        raise _http(e)
+
+    if svc.investigation_type_of(manifest) != "cost":
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{investigation_id}' is not a cost investigation.",
+        )
+
+    status = manifest.get("status")
+    if status == "completed":
+        try:
+            analysis = await svc.compose_analysis(sub, service, investigation_id)
+        except Exception as e:
+            raise _http(e)
+        return {"investigation_id": investigation_id, "status": "completed",
+                "analysis": analysis}
+
+    if status == "failed":
+        return {"investigation_id": investigation_id, "status": "failed",
+                "error": manifest.get("error"), "manifest": manifest}
+
+    current_stage_key = manifest.get("current_stage")
+    current_step = STEP_LABELS.get(current_stage_key, current_stage_key) or "Starting"
+    return {
+        "investigation_id": investigation_id,
+        "status": "running",
+        "current_step": current_step,
+        "elapsed_seconds": manifest.get("total_seconds_so_far"),
+        "active_agents": manifest.get("active_agents", []),
+        "dispatched_agents": manifest.get("dispatched_agents", []),
+        "findings_count": manifest.get("findings_count"),
+        "validated_findings_count": manifest.get("validated_findings_count"),
+        "root_causes_count": manifest.get("root_causes_count"),
+        "recommendations_count": manifest.get("recommendations_count"),
+    }
+
+
 @app.get("/api/health")
 def health():
     with _lock:

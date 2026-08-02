@@ -389,6 +389,65 @@ class DashboardService:
         return await self.investigations(subscription_id).get(
             service, investigation_id, MANIFEST)
 
+    # ---- runtime vs cost investigation listing (per-subscription) -------
+
+    @staticmethod
+    def _investigation_type_of(manifest: dict) -> str:
+        """manifest.investigation_type is the source of truth going forward.
+        Older manifests persisted before this field existed are inferred from
+        item_type=='workspace', which only cost investigations ever set."""
+        it = manifest.get("investigation_type")
+        if it:
+            return it
+        return "cost" if manifest.get("item_type") == "workspace" else "runtime"
+
+    async def _completed_investigations_by_type(
+        self, subscription_id: str, investigation_type: str,
+    ) -> dict[str, dict[str, str]]:
+        """{service: {item_name: investigation_id}} for the most recent
+        COMPLETED (never failed) investigation of the given type, per item."""
+        inv = self.investigations(subscription_id)
+        services = await inv.list_services()
+
+        result: dict[str, dict[str, str]] = {}
+        for service in services:
+            ids = await inv.list_investigation_ids(service)  # newest-first
+            per_item: dict[str, str] = {}
+            for investigation_id in ids:
+                try:
+                    manifest = await inv.get(service, investigation_id, MANIFEST)
+                except PersistenceError:
+                    continue
+                if manifest.get("status") != "completed":
+                    continue
+                if self._investigation_type_of(manifest) != investigation_type:
+                    continue
+                item_name = manifest.get("item_name")
+                if not item_name or item_name in per_item:
+                    continue  # already have the newest completed one for this item
+                per_item[item_name] = manifest.get("investigation_id", investigation_id)
+            if per_item:
+                result[service] = per_item
+        return result
+
+    async def list_runtime_investigations(self, subscription_id: str) -> dict[str, dict[str, str]]:
+        """{service: {item_name: investigation_id}} - latest COMPLETED
+        runtime-deviation investigation per pipeline/job. Cost investigations
+        are never included here."""
+        return await self._completed_investigations_by_type(subscription_id, "runtime")
+
+    async def list_cost_investigations(self, subscription_id: str) -> dict[str, dict[str, str]]:
+        """{service: {workspace_name: investigation_id}} - latest COMPLETED
+        cost-deviation investigation per workspace. Runtime investigations
+        are never included here."""
+        return await self._completed_investigations_by_type(subscription_id, "cost")
+
+    def investigation_type_of(self, manifest: dict) -> str:
+        """Public wrapper around _investigation_type_of, for callers (e.g.
+        main.py) that need to check a manifest's type without reaching
+        into a private method."""
+        return self._investigation_type_of(manifest)
+
     async def compose_analysis(self, subscription_id: str, service: str,
                                investigation_id: str) -> dict:
         inv = self.investigations(subscription_id)

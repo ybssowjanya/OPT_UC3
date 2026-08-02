@@ -33,6 +33,10 @@ class BaseDocumentStore:
                   filename: str, payload) -> None:
         raise NotImplementedError
 
+    async def list_services(self) -> list[str]:
+        """Every service name that has at least one investigation folder."""
+        raise NotImplementedError
+
     @staticmethod
     def blob_path(service: str, investigation_id: str, filename: str) -> str:
         return f"{service}/{investigation_id}/{filename}"
@@ -164,6 +168,18 @@ class BlobDocumentStore(BaseDocumentStore):
     async def list_investigation_ids(self, service: str) -> list[str]:
         return await asyncio.to_thread(self._list_ids_sync, service)
 
+    def _list_services_sync(self) -> list[str]:
+        container = self._connect()
+        services = []
+        for item in container.walk_blobs(name_starts_with="", delimiter="/"):
+            name = getattr(item, "name", "")
+            if name.endswith("/"):
+                services.append(name.rstrip("/"))
+        return sorted(services)
+
+    async def list_services(self) -> list[str]:
+        return await asyncio.to_thread(self._list_services_sync)
+
 
 class LocalDocumentStore(BaseDocumentStore):
 
@@ -190,6 +206,11 @@ class LocalDocumentStore(BaseDocumentStore):
         if not d.exists():
             return []
         return sorted((p.name for p in d.iterdir() if p.is_dir()), reverse=True)
+
+    async def list_services(self) -> list[str]:
+        if not self.root.exists():
+            return []
+        return sorted(p.name for p in self.root.iterdir() if p.is_dir())
 
 
 def build_document_store(telemetry_store) -> BlobDocumentStore:

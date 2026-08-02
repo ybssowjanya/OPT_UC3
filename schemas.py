@@ -195,6 +195,10 @@ class InvestigationContext:
             activities=[],
 
             raw_payload=payload,
+            investigation_type="cost",  # FIX: this second from_cost_payload overload previously
+                                        # omitted this, so cost investigations were silently
+                                        # tagged 'runtime' (the dataclass default). Restored here
+                                        # without touching anything else in this method.
         )
 
     def degraded_activities(self) -> list[ActivityDeviation]:
