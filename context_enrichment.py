@@ -11,8 +11,11 @@ agent. Collects everything related to the deviating item:
   enrichment["dependencies"] - {activity_name: [upstream_activity, ...]}
 
 Mapping rules by service:
-  databricks : task_key == notebook asset name
-               telemetry/databricks/{rg}/{ws}/notebooks/{task_key}.json
+  databricks : each task in extra_metadata.tasks carries its own notebook_path -
+               the last path segment is the notebook asset name (task_key is
+               NOT reliably the notebook name, e.g. task_key
+               "update_Analytics_system" -> notebook_path ".../Update_Ledger") ->
+               telemetry/databricks/{rg}/{ws}/notebooks/{notebook_name}.json
                (source in extra_metadata.source_code)
   synapse/adf: activity in the pipeline definition carries a
                notebook.reference_name ->
@@ -129,11 +132,26 @@ def _resolve_notebook_reference(service: str, item_definition: dict,
                                 activity: ActivityDeviation) -> str:
     """Which notebook asset implements this activity"""
     if service == "databricks":
-        # convention: task_key == notebook name
-        return activity.activity_name
+        
+        extra = (item_definition or {}).get("extra_metadata") or {}
+        tasks = extra.get("tasks") or []
+        for task in tasks:
+            if task.get("task_key") != activity.activity_name:
+                continue
+            path = task.get("notebook_path")
+            if path:
+                return path.rstrip("/").rsplit("/", 1)[-1]
+            raise TelemetryFetchError(
+                f"Task '{activity.activity_name}' in job definition has no "
+                f"notebook_path (task_type={task.get('task_type')!r}) - it is "
+                "likely a control-flow task (condition_task/for_each_task) "
+                "with no notebook to enrich."
+            )
+        raise TelemetryFetchError(
+            f"Task '{activity.activity_name}' not found in job definition's "
+            "extra_metadata.tasks - cannot resolve which notebook implements it."
+        )
 
-    # synapse / adf: find the activity inside the pipeline definition and
-    # read its notebook reference (search recursively through nested containers)
     extra = (item_definition or {}).get("extra_metadata") or {}
     for act_def in _flatten_activities(extra.get("activities", []) or []):
         if act_def.get("name") == activity.activity_name:
@@ -218,18 +236,28 @@ class TelemetryEnricher:
         )
         ctx.enrichment["recent_runs"] = _compact_runs(runs)
 
-        # 3. REAL notebook source for every degraded notebook-bearing activity
+        # 3. REAL notebook source for every degraded notebook-bearing activity.
         notebooks: dict[str, dict] = {}
+        enrichment_gaps: list[dict] = []
         for activity in ctx.degraded_activities():
             if activity.activity_type not in NOTEBOOK_BEARING_TYPES:
                 continue
-            notebook_name = _resolve_notebook_reference(ctx.service, definition, activity)
-            asset = await self.store.fetch_notebook(
-                ctx.service, ctx.resource_group, ctx.workspace_name, notebook_name,
-            )
-            notebooks[activity.activity_name] = _extract_notebook_payload(asset)
+            try:
+                notebook_name = _resolve_notebook_reference(ctx.service, definition, activity)
+                asset = await self.store.fetch_notebook(
+                    ctx.service, ctx.resource_group, ctx.workspace_name, notebook_name,
+                )
+                notebooks[activity.activity_name] = _extract_notebook_payload(asset)
+            except TelemetryFetchError as e:
+                enrichment_gaps.append({
+                    "activity_name": activity.activity_name,
+                    "activity_type": activity.activity_type,
+                    "reason": str(e),
+                })
         if notebooks:
             ctx.enrichment["notebooks"] = notebooks
+        if enrichment_gaps:
+            ctx.enrichment["notebook_enrichment_gaps"] = enrichment_gaps
 
         # 4. dependency graph
         deps = _extract_dependencies(definition, ctx.enrichment["recent_runs"])
