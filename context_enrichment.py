@@ -36,6 +36,7 @@ NOTEBOOK_BEARING_TYPES = {"notebook_task", "SynapseNotebook", "dlt_pipeline"}
 # hard cap per notebook so a 10-activity job can't explode the prompt
 MAX_SOURCE_CHARS = 12_000
 RECENT_RUNS_LIMIT = 5
+SYNTHESIS_RUNS_LIMIT = 30
 
 
 def _truncate(source: str, limit: int = MAX_SOURCE_CHARS) -> str:
@@ -132,7 +133,10 @@ def _resolve_notebook_reference(service: str, item_definition: dict,
                                 activity: ActivityDeviation) -> str:
     """Which notebook asset implements this activity"""
     if service == "databricks":
-        
+        # Databricks tasks declare their own notebook_path - task_key is
+        # frequently NOT the notebook name (e.g. task_key "update_Analytics_system"
+        # -> notebook_path ".../Update_Ledger"). Read the real path from the
+        # job definition rather than assuming they match.
         extra = (item_definition or {}).get("extra_metadata") or {}
         tasks = extra.get("tasks") or []
         for task in tasks:
@@ -152,6 +156,8 @@ def _resolve_notebook_reference(service: str, item_definition: dict,
             "extra_metadata.tasks - cannot resolve which notebook implements it."
         )
 
+    # synapse / adf: find the activity inside the pipeline definition and
+    # read its notebook reference (search recursively through nested containers)
     extra = (item_definition or {}).get("extra_metadata") or {}
     for act_def in _flatten_activities(extra.get("activities", []) or []):
         if act_def.get("name") == activity.activity_name:
@@ -185,6 +191,65 @@ def _compact_runs(runs: list[dict]) -> list[dict]:
         }
         for r in runs
     ]
+
+_RUN_IDENTITY_KEYS = (
+    "job_name", "activity_name", "task_key", "notebook_name",
+    "session_name", "application_name", "name",
+)
+
+
+def _run_identity(run: dict) -> str:
+    extra = run.get("extra_metadata") or {}
+    for key in _RUN_IDENTITY_KEYS:
+        val = extra.get(key)
+        if val:
+            return str(val)
+    return run.get("item_name") or "unidentified_run"
+
+
+def _synthesize_pseudo_activities(runs: list[dict]) -> list[dict]:
+    
+    grouped: dict[str, list[dict]] = {}
+    for r in runs:
+        grouped.setdefault(_run_identity(r), []).append(r)
+
+    pseudo: list[dict] = []
+    for identity, group_runs in grouped.items():
+        durations = [r.get("duration_seconds") for r in group_runs
+                     if r.get("duration_seconds") is not None]
+        if not durations:
+            continue
+
+        runs_sorted = sorted(group_runs, key=lambda r: r.get("start_time") or "")
+        latest = runs_sorted[-1]
+        avg = sum(durations) / len(durations)
+        latest_duration = latest.get("duration_seconds") or 0.0
+        deviation_seconds = latest_duration - avg
+        deviation_pct = (deviation_seconds / avg * 100) if avg else 0.0
+        # job/pipeline activities
+        if abs(deviation_pct) >= 30:
+            health = "Severe"
+        elif abs(deviation_pct) >= 10:
+            health = "Warning"
+        else:
+            health = "Healthy"
+
+        error_runs = [r for r in group_runs if r.get("error_message")]
+        success_rate_pct = 100.0 * (len(group_runs) - len(error_runs)) / len(group_runs)
+
+        pseudo.append({
+            "activity_name": identity,
+            "activity_type": "synthesized_activity",
+            "avg_duration_seconds": round(avg, 2),
+            "latest_duration_seconds": latest_duration,
+            "deviation_seconds": round(deviation_seconds, 2),
+            "deviation_pct": round(deviation_pct, 2),
+            "success_rate_pct": round(success_rate_pct, 2),
+            "health": health,
+            "synthetic": True,
+            "sample_size": len(group_runs),
+        })
+    return pseudo
 
 
 def _extract_dependencies(item_definition: dict, recent_runs: list[dict]) -> dict:
@@ -236,7 +301,32 @@ class TelemetryEnricher:
         )
         ctx.enrichment["recent_runs"] = _compact_runs(runs)
 
+        if not ctx.activities:
+            synth_runs = runs
+            if len(runs) < SYNTHESIS_RUNS_LIMIT:
+                synth_runs = await self.store.fetch_item_runs(
+                    ctx.service, ctx.resource_group, ctx.workspace_name,
+                    ctx.item_type, ctx.item_name, limit=SYNTHESIS_RUNS_LIMIT,
+                )
+            pseudo = _synthesize_pseudo_activities(synth_runs)
+            if pseudo:
+                ctx.activities = [ActivityDeviation.from_raw(p) for p in pseudo]
+                ctx.enrichment["activities_synthesized"] = True
+                ctx.enrichment["activities_synthesis_note"] = (
+                    f"No per-activity baseline was provided upstream for this "
+                    f"item ({ctx.item_type}). These activities were derived "
+                    "on-the-fly from recent run history, grouped by whatever "
+                    "run-identity field was present, using a limited sample "
+                    "and simple heuristic thresholds - treat with lower "
+                    "confidence than baseline-derived findings."
+                )
+
         # 3. REAL notebook source for every degraded notebook-bearing activity.
+        # A single unresolvable/missing notebook must NOT abort the whole
+        # investigation - record the gap and let enrichment continue, so
+        # agents that don't need code (runtime, configuration, dependency)
+        # can still run, and code-aware agents fail open per-activity
+        # (they already refuse to guess without enriched source).
         notebooks: dict[str, dict] = {}
         enrichment_gaps: list[dict] = []
         for activity in ctx.degraded_activities():
