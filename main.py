@@ -276,7 +276,7 @@ async def cost_investigation_detail(sub: str, service: str, investigation_id: st
     status = manifest.get("status")
     if status == "completed":
         try:
-            analysis = await svc.compose_analysis(sub, service, investigation_id)
+            analysis = await svc.final_report(sub, service, investigation_id)
         except Exception as e:
             raise _http(e)
         return {"investigation_id": investigation_id, "status": "completed",
