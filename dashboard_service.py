@@ -388,7 +388,14 @@ class DashboardService:
                                    investigation_id: str) -> dict:
         return await self.investigations(subscription_id).get(
             service, investigation_id, MANIFEST)
-
+    
+    async def final_report(self, subscription_id: str, service: str,
+                           investigation_id: str) -> dict:
+        """Same dict shape as state.final_report in PlannerAgent - exactly
+        what /post-cost-investigation returns."""
+        return await self.investigations(subscription_id).get(
+            service, investigation_id, FINAL_REPORT)
+    
     # ---- runtime vs cost investigation listing (per-subscription) -------
 
     @staticmethod
